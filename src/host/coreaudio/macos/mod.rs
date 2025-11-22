@@ -9,7 +9,11 @@ use coreaudio::audio_unit::AudioUnit;
 use objc2_core_audio::AudioDeviceID;
 use std::sync::{mpsc, Arc, Mutex, Weak};
 
-pub use self::enumerate::{default_input_device, default_output_device, Devices};
+#[allow(unused_imports)]
+pub use self::enumerate::{
+    default_input_device, default_output_device, Devices, SupportedInputConfigs,
+    SupportedOutputConfigs,
+};
 
 use objc2_core_audio::{
     kAudioDevicePropertyDeviceIsAlive, kAudioObjectPropertyElementMain,

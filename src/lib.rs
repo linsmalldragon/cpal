@@ -241,6 +241,7 @@ pub enum DeviceId {
     WebAudio(String),
     WebAudioWorklet(String),
     Emscripten(String),
+    ScreenCaptureKit(u32),
     Null,
 }
 
@@ -256,6 +257,7 @@ impl std::fmt::Display for DeviceId {
             DeviceId::WebAudio(default) => write!(f, "webaudio:{}", default),
             DeviceId::WebAudioWorklet(default) => write!(f, "webaudioworklet:{}", default),
             DeviceId::Emscripten(default) => write!(f, "emscripten:{}", default),
+            DeviceId::ScreenCaptureKit(display_id) => write!(f, "screencapturekit:{}", display_id),
             DeviceId::Null => write!(f, "null:null"),
         }
     }
@@ -289,6 +291,14 @@ impl std::str::FromStr for DeviceId {
             "webaudio" => Ok(DeviceId::WebAudio(data.to_string())),
             "webaudioworklet" => Ok(DeviceId::WebAudioWorklet(data.to_string())),
             "emscripten" => Ok(DeviceId::Emscripten(data.to_string())),
+            "screencapturekit" => {
+                let id = data.parse().map_err(|_| DeviceIdError::BackendSpecific {
+                    err: BackendSpecificError {
+                        description: format!("Failed to parse screencapturekit device id: {}", data),
+                    },
+                })?;
+                Ok(DeviceId::ScreenCaptureKit(id))
+            }
             "null" => Ok(DeviceId::Null),
             &_ => todo!("implement DeviceId::FromStr for {platform}"),
         }

@@ -657,7 +657,7 @@ mod platform_impl {
     };
     impl_platform_host!(
         CoreAudio => CoreAudioHost,
-        #[cfg(feature = "custom")] Custom => super::CustomHost
+        #[cfg(feature = "custom")] Custom => super::CustomHost,
         #[cfg(any(target_os = "macos"))] ScreenCaptureKit => super::ScreenCaptureKitHost
     );
 

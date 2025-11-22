@@ -1,11 +1,13 @@
 use std::{cell::RefCell, rc::Rc, time::Duration};
 
 use crate::{
+    device_description::DeviceDescriptionBuilder,
     traits::{DeviceTrait, HostTrait, StreamTrait},
-    BackendSpecificError, BuildStreamError, Data, DefaultStreamConfigError, DevicesError,
-    InputCallbackInfo, OutputCallbackInfo, PauseStreamError, PlayStreamError, SampleFormat,
-    SampleRate, StreamConfig, StreamError, StreamInstant, SupportedBufferSize,
-    SupportedStreamConfig, SupportedStreamConfigRange, SupportedStreamConfigsError,
+    BackendSpecificError, BuildStreamError, Data, DefaultStreamConfigError, DeviceDescription,
+    DeviceId, DeviceIdError, DeviceNameError, DevicesError, InputCallbackInfo, OutputCallbackInfo,
+    PauseStreamError, PlayStreamError, SampleFormat, SampleRate, StreamConfig, StreamError,
+    StreamInstant, SupportedBufferSize, SupportedStreamConfig, SupportedStreamConfigRange,
+    SupportedStreamConfigsError,
 };
 
 use cidre::{
@@ -64,8 +66,21 @@ impl DeviceTrait for Device {
 
     type Stream = Stream;
 
-    fn name(&self) -> Result<String, crate::DeviceNameError> {
+    fn name(&self) -> Result<String, DeviceNameError> {
         Ok(self.name().clone())
+    }
+
+    fn description(&self) -> Result<DeviceDescription, DeviceNameError> {
+        let name = self.name();
+        Ok(DeviceDescriptionBuilder::new(name)
+            .device_type(crate::device_description::DeviceType::Unknown)
+            .interface_type(crate::device_description::InterfaceType::Unknown)
+            .direction(crate::device_description::DeviceDirection::Input)
+            .build())
+    }
+
+    fn id(&self) -> Result<DeviceId, DeviceIdError> {
+        Ok(DeviceId::ScreenCaptureKit(self.display.display_id()))
     }
 
     fn supported_input_configs(
