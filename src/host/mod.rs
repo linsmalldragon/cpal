@@ -23,6 +23,10 @@ pub(crate) mod emscripten;
     feature = "jack"
 ))]
 pub(crate) mod jack;
+
+#[cfg(target_os = "macos")]
+pub(crate) mod screencapturekit;
+
 #[cfg(windows)]
 pub(crate) mod wasapi;
 #[cfg(all(
