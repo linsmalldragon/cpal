@@ -73,7 +73,7 @@ impl DeviceTrait for Device {
     fn description(&self) -> Result<DeviceDescription, DeviceNameError> {
         let name = self.name();
         Ok(DeviceDescriptionBuilder::new(name)
-            .device_type(crate::device_description::DeviceType::Unknown)
+            .device_type(crate::device_description::DeviceType::ScreenCaptureKit)
             .interface_type(crate::device_description::InterfaceType::Unknown)
             .direction(crate::device_description::DeviceDirection::Input)
             .build())

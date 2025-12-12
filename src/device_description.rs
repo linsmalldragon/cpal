@@ -70,6 +70,8 @@ pub enum DeviceType {
     /// Virtual/loopback device (software audio routing)
     Virtual,
 
+    ScreenCaptureKit,
+
     /// Unknown or unclassified device type
     #[default]
     Unknown,
