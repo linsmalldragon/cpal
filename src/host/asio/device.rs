@@ -1,5 +1,4 @@
-pub type SupportedInputConfigs = std::vec::IntoIter<SupportedStreamConfigRange>;
-pub type SupportedOutputConfigs = std::vec::IntoIter<SupportedStreamConfigRange>;
+pub use crate::iter::{SupportedInputConfigs, SupportedOutputConfigs};
 
 use super::sys;
 use crate::BackendSpecificError;
@@ -7,13 +6,11 @@ use crate::ChannelCount;
 use crate::DefaultStreamConfigError;
 use crate::DeviceDescription;
 use crate::DeviceDescriptionBuilder;
-use crate::DeviceDirection;
 use crate::DeviceId;
 use crate::DeviceIdError;
 use crate::DeviceNameError;
 use crate::DevicesError;
 use crate::SampleFormat;
-use crate::SampleRate;
 use crate::SupportedBufferSize;
 use crate::SupportedStreamConfig;
 use crate::SupportedStreamConfigRange;
@@ -72,7 +69,10 @@ impl Device {
     }
 
     pub fn id(&self) -> Result<DeviceId, DeviceIdError> {
-        Ok(DeviceId::Asio(self.driver.name().to_string()))
+        Ok(DeviceId(
+            crate::platform::HostId::Asio,
+            self.driver.name().to_string(),
+        ))
     }
 
     /// Gets the supported input configs.
@@ -93,7 +93,7 @@ impl Device {
         for &rate in crate::COMMON_SAMPLE_RATES {
             if !self
                 .driver
-                .can_sample_rate(rate.0.into())
+                .can_sample_rate(rate.into())
                 .ok()
                 .unwrap_or(false)
             {
@@ -130,7 +130,7 @@ impl Device {
         for &rate in crate::COMMON_SAMPLE_RATES {
             if !self
                 .driver
-                .can_sample_rate(rate.0.into())
+                .can_sample_rate(rate.into())
                 .ok()
                 .unwrap_or(false)
             {
@@ -152,7 +152,7 @@ impl Device {
     /// Returns the default input config
     pub fn default_input_config(&self) -> Result<SupportedStreamConfig, DefaultStreamConfigError> {
         let channels = self.driver.channels().map_err(default_config_err)?.ins as u16;
-        let sample_rate = SampleRate(self.driver.sample_rate().map_err(default_config_err)? as _);
+        let sample_rate = self.driver.sample_rate().map_err(default_config_err)? as u32;
         let (min, max) = self.driver.buffersize_range().map_err(default_config_err)?;
         let buffer_size = SupportedBufferSize::Range {
             min: min as u32,
@@ -173,7 +173,7 @@ impl Device {
     /// Returns the default output config
     pub fn default_output_config(&self) -> Result<SupportedStreamConfig, DefaultStreamConfigError> {
         let channels = self.driver.channels().map_err(default_config_err)?.outs as u16;
-        let sample_rate = SampleRate(self.driver.sample_rate().map_err(default_config_err)? as _);
+        let sample_rate = self.driver.sample_rate().map_err(default_config_err)? as u32;
         let (min, max) = self.driver.buffersize_range().map_err(default_config_err)?;
         let buffer_size = SupportedBufferSize::Range {
             min: min as u32,

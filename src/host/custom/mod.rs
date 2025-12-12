@@ -1,3 +1,8 @@
+//! Custom host backend.
+//!
+//! Allows user-defined host implementations with the `custom` feature.
+//! See `examples/custom.rs` for usage.
+
 use crate::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crate::{
     BuildStreamError, Data, DefaultStreamConfigError, DeviceDescription, DeviceId, DeviceIdError,
@@ -216,6 +221,7 @@ where
     T::SupportedOutputConfigs: Clone + 'static,
     T::Stream: Send + Sync + 'static,
 {
+    #[allow(deprecated)]
     fn name(&self) -> Result<String, DeviceNameError> {
         <T as DeviceTrait>::name(self)
     }

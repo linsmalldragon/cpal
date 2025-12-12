@@ -1,3 +1,7 @@
+//! ALSA backend implementation.
+//!
+//! Default backend on Linux and BSD systems.
+
 extern crate alsa;
 extern crate libc;
 
@@ -92,8 +96,7 @@ fn parse_alsa_description(description: &str) -> Vec<String> {
 // (start_threshold = 2 periods), ensuring low latency even with large multi-period ring
 // buffers.
 
-pub type SupportedInputConfigs = VecIntoIter<SupportedStreamConfigRange>;
-pub type SupportedOutputConfigs = VecIntoIter<SupportedStreamConfigRange>;
+pub use crate::iter::{SupportedInputConfigs, SupportedOutputConfigs};
 
 mod enumerate;
 
@@ -311,6 +314,29 @@ pub struct Device {
     handles: Arc<Mutex<DeviceHandles>>,
 }
 
+impl PartialEq for Device {
+    fn eq(&self, other: &Self) -> bool {
+        // Devices are equal if they have the same PCM ID and direction.
+        // The handles field is not part of device identity.
+        self.pcm_id == other.pcm_id && self.direction == other.direction
+    }
+}
+
+impl Eq for Device {}
+
+impl std::hash::Hash for Device {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // Hash based on PCM ID and direction for consistency with PartialEq
+        self.pcm_id.hash(state);
+        // Manually hash direction since alsa::Direction doesn't implement Hash
+        match self.direction {
+            Some(alsa::Direction::Capture) => 0u8.hash(state),
+            Some(alsa::Direction::Playback) => 1u8.hash(state),
+            None => 2u8.hash(state),
+        }
+    }
+}
+
 impl Device {
     fn build_stream_inner(
         &self,
@@ -430,7 +456,7 @@ impl Device {
     }
 
     fn id(&self) -> Result<DeviceId, DeviceIdError> {
-        Ok(DeviceId::Alsa(self.pcm_id.clone()))
+        Ok(DeviceId(crate::platform::HostId::Alsa, self.pcm_id.clone()))
     }
 
     fn supported_configs(
@@ -516,8 +542,8 @@ impl Device {
         } else {
             let mut rates = Vec::new();
             for &sample_rate in crate::COMMON_SAMPLE_RATES.iter() {
-                if hw_params.test_rate(sample_rate.0).is_ok() {
-                    rates.push((sample_rate.0, sample_rate.0));
+                if hw_params.test_rate(sample_rate).is_ok() {
+                    rates.push((sample_rate, sample_rate));
                 }
             }
 
@@ -556,8 +582,8 @@ impl Device {
                 for &(min_rate, max_rate) in sample_rates.iter() {
                     output.push(SupportedStreamConfigRange {
                         channels,
-                        min_sample_rate: SampleRate(min_rate),
-                        max_sample_rate: SampleRate(max_rate),
+                        min_sample_rate: min_rate,
+                        max_sample_rate: max_rate,
                         buffer_size: buffer_size_range,
                         sample_format,
                     });
@@ -610,7 +636,7 @@ impl Device {
                 let min_r = f.min_sample_rate;
                 let max_r = f.max_sample_rate;
                 let mut format = f.with_max_sample_rate();
-                const HZ_44100: SampleRate = SampleRate(44_100);
+                const HZ_44100: SampleRate = 44_100;
                 if min_r <= HZ_44100 && HZ_44100 <= max_r {
                     format.sample_rate = HZ_44100;
                 }
@@ -768,6 +794,7 @@ fn input_stream_worker(
                 continue;
             }
             PollDescriptorsFlow::XRun => {
+                error_callback(StreamError::BufferUnderrun);
                 if let Err(err) = stream.channel.prepare() {
                     error_callback(err.into());
                 }
@@ -819,6 +846,7 @@ fn output_stream_worker(
         match flow {
             PollDescriptorsFlow::Continue => continue,
             PollDescriptorsFlow::XRun => {
+                error_callback(StreamError::BufferUnderrun);
                 if let Err(err) = stream.channel.prepare() {
                     error_callback(err.into());
                 }
@@ -861,7 +889,7 @@ fn boost_current_thread_priority(buffer_size: BufferSize, sample_rate: SampleRat
         0
     };
 
-    if let Err(err) = promote_current_thread_to_real_time(buffer_size, sample_rate.0) {
+    if let Err(err) = promote_current_thread_to_real_time(buffer_size, sample_rate) {
         eprintln!("Failed to promote audio thread to real-time priority: {err}");
     }
 }
@@ -930,7 +958,7 @@ fn poll_descriptors_and_prepare_buffer(
         res => res,
     }? as usize;
     let delay_frames = match status.get_delay() {
-        // Buffer underrun. TODO: Notify the user.
+        // Buffer underrun detected, but notification happens in XRun handler
         d if d < 0 => 0,
         d => d as usize,
     };
@@ -1020,11 +1048,10 @@ fn process_output(
                 // See https://github.com/alsa-project/alsa-lib/blob/b154d9145f0e17b9650e4584ddfdf14580b4e0d7/src/pcm/pcm.c#L8767-L8770
                 // Even if these recover successfully, they still may cause audible glitches.
 
-                // TODO:
-                //   Should we notify the user about successfully recovered errors?
-                //   Should we notify the user about failures in try_recover, rather than ignoring them?
-                //   (Both potentially not real-time-safe)
-                _ = stream.channel.try_recover(err, true);
+                error_callback(StreamError::BufferUnderrun);
+                if let Err(recover_err) = stream.channel.try_recover(err, true) {
+                    error_callback(recover_err.into());
+                }
             }
             Err(err) => {
                 error_callback(err.into());
@@ -1102,7 +1129,7 @@ fn timespec_diff_nanos(a: libc::timespec, b: libc::timespec) -> i64 {
 // Convert the given duration in frames at the given sample rate to a `std::time::Duration`.
 #[inline]
 fn frames_to_duration(frames: usize, rate: crate::SampleRate) -> std::time::Duration {
-    let secsf = frames as f64 / rate.0 as f64;
+    let secsf = frames as f64 / rate as f64;
     let secs = secsf as u64;
     let nanos = ((secsf - secs as f64) * 1_000_000_000.0) as u32;
     std::time::Duration::new(secs, nanos)
@@ -1193,9 +1220,10 @@ impl StreamTrait for Stream {
     }
 }
 
-// Overly safe clamp because alsa Frames are i64 (64-bit) or i32 (32-bit)
+// Convert ALSA frames to FrameCount, clamping to valid range.
+// ALSA Frames are i64 (64-bit) or i32 (32-bit).
 fn clamp_frame_count(buffer_size: alsa::pcm::Frames) -> FrameCount {
-    buffer_size.clamp(1, FrameCount::MAX as alsa::pcm::Frames) as FrameCount
+    buffer_size.max(1).try_into().unwrap_or(FrameCount::MAX)
 }
 
 fn hw_params_buffer_size_min_max(hw_params: &alsa::pcm::HwParams) -> (FrameCount, FrameCount) {
@@ -1273,7 +1301,7 @@ fn init_hw_params<'a>(
     let alsa_format = sample_format_to_alsa_format(&hw_params, sample_format)?;
     hw_params.set_format(alsa_format)?;
 
-    hw_params.set_rate(config.sample_rate.0, alsa::ValueOr::Nearest)?;
+    hw_params.set_rate(config.sample_rate, alsa::ValueOr::Nearest)?;
     hw_params.set_channels(config.channels as u32)?;
     Ok(hw_params)
 }

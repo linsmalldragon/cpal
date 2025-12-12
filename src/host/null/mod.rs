@@ -1,3 +1,7 @@
+//! Null backend implementation.
+//!
+//! Fallback no-op backend for unsupported platforms.
+
 use std::time::Duration;
 
 use crate::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -11,7 +15,7 @@ use crate::{
 #[derive(Default)]
 pub struct Devices;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Device;
 
 pub struct Host;
@@ -55,7 +59,7 @@ impl DeviceTrait for Device {
     }
 
     fn id(&self) -> Result<DeviceId, DeviceIdError> {
-        Ok(DeviceId::Null)
+        Ok(DeviceId(crate::platform::HostId::Null, String::new()))
     }
 
     fn supported_input_configs(

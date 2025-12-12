@@ -40,7 +40,6 @@ pub use super::enumerate::{
 use std::fmt;
 use std::mem::{self, size_of};
 use std::ptr::{null, NonNull};
-use std::slice;
 use std::sync::mpsc::{channel, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -62,60 +61,59 @@ fn set_sample_rate(
         mElement: kAudioObjectPropertyElementMaster,
     };
     let mut sample_rate: f64 = 0.0;
-    let data_size = mem::size_of::<f64>() as u32;
+    let mut data_size = mem::size_of::<f64>() as u32;
     let status = unsafe {
         AudioObjectGetPropertyData(
             audio_device_id,
             NonNull::from(&property_address),
             0,
             null(),
-            NonNull::from(&data_size),
+            NonNull::from(&mut data_size),
             NonNull::from(&mut sample_rate).cast(),
         )
     };
     coreaudio::Error::from_os_status(status)?;
 
     // If the requested sample rate is different to the device sample rate, update the device.
-    if sample_rate as u32 != target_sample_rate.0 {
+    if sample_rate as u32 != target_sample_rate {
         // Get available sample rate ranges.
         property_address.mSelector = kAudioDevicePropertyAvailableNominalSampleRates;
-        let data_size = 0u32;
+        let mut data_size = 0u32;
         let status = unsafe {
             AudioObjectGetPropertyDataSize(
                 audio_device_id,
                 NonNull::from(&property_address),
                 0,
                 null(),
-                NonNull::from(&data_size),
+                NonNull::from(&mut data_size),
             )
         };
         coreaudio::Error::from_os_status(status)?;
         let n_ranges = data_size as usize / mem::size_of::<AudioValueRange>();
-        let mut ranges: Vec<u8> = vec![];
-        ranges.reserve_exact(data_size as usize);
+        let mut ranges: Vec<AudioValueRange> = Vec::with_capacity(n_ranges);
         let status = unsafe {
             AudioObjectGetPropertyData(
                 audio_device_id,
                 NonNull::from(&property_address),
                 0,
                 null(),
-                NonNull::from(&data_size),
+                NonNull::from(&mut data_size),
                 NonNull::new(ranges.as_mut_ptr()).unwrap().cast(),
             )
         };
         coreaudio::Error::from_os_status(status)?;
-        let ranges: *mut AudioValueRange = ranges.as_mut_ptr() as *mut _;
-        let ranges: &[AudioValueRange] = unsafe { slice::from_raw_parts(ranges, n_ranges) };
+        unsafe {
+            ranges.set_len(n_ranges);
+        }
 
         // Now that we have the available ranges, pick the one matching the desired rate.
-        let sample_rate = target_sample_rate.0;
-        let maybe_index = ranges
+        let sample_rate = target_sample_rate;
+        if !ranges
             .iter()
-            .position(|r| r.mMinimum as u32 == sample_rate && r.mMaximum as u32 == sample_rate);
-        let range_index = match maybe_index {
-            None => return Err(BuildStreamError::StreamConfigNotSupported),
-            Some(i) => i,
-        };
+            .any(|r| sample_rate as f64 >= r.mMinimum && sample_rate as f64 <= r.mMaximum)
+        {
+            return Err(BuildStreamError::StreamConfigNotSupported);
+        }
 
         let (send, recv) = channel::<Result<f64, coreaudio::Error>>();
         let sample_rate_address = AudioObjectPropertyAddress {
@@ -126,7 +124,7 @@ fn set_sample_rate(
         // Send sample rate updates back on a channel.
         let sample_rate_handler = move || {
             let mut rate: f64 = 0.0;
-            let data_size = mem::size_of::<f64>() as u32;
+            let mut data_size = mem::size_of::<f64>() as u32;
 
             let result = unsafe {
                 AudioObjectGetPropertyData(
@@ -134,7 +132,7 @@ fn set_sample_rate(
                     NonNull::from(&sample_rate_address),
                     0,
                     null(),
-                    NonNull::from(&data_size),
+                    NonNull::from(&mut data_size),
                     NonNull::from(&mut rate).cast(),
                 )
             };
@@ -150,6 +148,9 @@ fn set_sample_rate(
 
         // Finally, set the sample rate.
         property_address.mSelector = kAudioDevicePropertyNominalSampleRate;
+        // Set the nominal sample rate using a single f64 as required by CoreAudio.
+        let rate = sample_rate as f64;
+        let data_size = mem::size_of::<f64>() as u32;
         let status = unsafe {
             AudioObjectSetPropertyData(
                 audio_device_id,
@@ -157,7 +158,7 @@ fn set_sample_rate(
                 0,
                 null(),
                 data_size,
-                NonNull::from(&ranges[range_index]).cast(),
+                NonNull::from(&rate).cast(),
             )
         };
         coreaudio::Error::from_os_status(status)?;
@@ -185,7 +186,7 @@ fn set_sample_rate(
                     return Err(BackendSpecificError { description }.into());
                 }
                 Ok(Ok(reported_sample_rate)) => {
-                    if reported_sample_rate == target_sample_rate.0 as f64 {
+                    if reported_sample_rate == target_sample_rate as f64 {
                         break;
                     }
                 }
@@ -336,7 +337,7 @@ impl DeviceTrait for Device {
     }
 }
 
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, Hash, PartialEq)]
 pub struct Device {
     pub(crate) audio_device_id: AudioDeviceID,
 }
@@ -427,7 +428,7 @@ impl Device {
 
         // CFString is copied from the audio object, use wrap_under_create_rule
         let mut uid: *mut CFString = std::ptr::null_mut();
-        let data_size = size_of::<*mut CFString>() as u32;
+        let mut data_size = size_of::<*mut CFString>() as u32;
 
         // SAFETY: AudioObjectGetPropertyData is documented to write a CFString pointer
         // for kAudioDevicePropertyDeviceUID. We check the status code before use.
@@ -437,7 +438,7 @@ impl Device {
                 NonNull::from(&property_address),
                 0,
                 null(),
-                NonNull::from(&data_size),
+                NonNull::from(&mut data_size),
                 NonNull::from(&mut uid).cast(),
             )
         };
@@ -447,7 +448,7 @@ impl Device {
         // We now check if the returned uid is non-null before use.
         if !uid.is_null() {
             let uid_string = unsafe { CFString::wrap_under_create_rule(uid).to_string() };
-            Ok(DeviceId::CoreAudio(uid_string))
+            Ok(DeviceId(crate::platform::HostId::CoreAudio, uid_string))
         } else {
             Err(DeviceIdError::BackendSpecific {
                 err: BackendSpecificError {
@@ -471,13 +472,13 @@ impl Device {
 
         unsafe {
             // Retrieve the devices audio buffer list.
-            let data_size = 0u32;
+            let mut data_size = 0u32;
             let status = AudioObjectGetPropertyDataSize(
                 self.audio_device_id,
                 NonNull::from(&property_address),
                 0,
                 null(),
-                NonNull::from(&data_size),
+                NonNull::from(&mut data_size),
             );
             check_os_status(status)?;
 
@@ -488,25 +489,30 @@ impl Device {
                 NonNull::from(&property_address),
                 0,
                 null(),
-                NonNull::from(&data_size),
+                NonNull::from(&mut data_size),
                 NonNull::new(audio_buffer_list.as_mut_ptr()).unwrap().cast(),
             );
             check_os_status(status)?;
 
             let audio_buffer_list = audio_buffer_list.as_mut_ptr() as *mut AudioBufferList;
 
-            // If there's no buffers, skip.
-            if (*audio_buffer_list).mNumberBuffers == 0 {
+            // Read the number of buffers without assuming alignment (avoid UB).
+            let nb_ptr = core::ptr::addr_of!((*audio_buffer_list).mNumberBuffers);
+            let n_buffers = core::ptr::read_unaligned(nb_ptr) as usize;
+            // If there are no buffers, skip.
+            if n_buffers == 0 {
                 return Ok(vec![].into_iter());
             }
 
             // Count the number of channels as the sum of all channels in all output buffers.
-            let n_buffers = (*audio_buffer_list).mNumberBuffers as usize;
-            let first: *const AudioBuffer = (*audio_buffer_list).mBuffers.as_ptr();
-            let buffers: &[AudioBuffer] = slice::from_raw_parts(first, n_buffers);
-            let mut n_channels = 0;
-            for buffer in buffers {
-                n_channels += buffer.mNumberChannels as usize;
+            let first_buf_ptr =
+                core::ptr::addr_of!((*audio_buffer_list).mBuffers) as *const AudioBuffer;
+            let mut n_channels = 0usize;
+            for i in 0..n_buffers {
+                let buf_ptr = first_buf_ptr.add(i);
+                // Read potentially unaligned
+                let buf: AudioBuffer = core::ptr::read_unaligned(buf_ptr);
+                n_channels += buf.mNumberChannels as usize;
             }
 
             // TODO: macOS should support U8, I16, I32, F32 and F64. This should allow for using
@@ -522,31 +528,29 @@ impl Device {
             // See https://github.com/thestk/rtaudio/blob/master/RtAudio.cpp#L1369C1-L1375C39
 
             property_address.mSelector = kAudioDevicePropertyAvailableNominalSampleRates;
-            let data_size = 0u32;
+            let mut data_size = 0u32;
             let status = AudioObjectGetPropertyDataSize(
                 self.audio_device_id,
                 NonNull::from(&property_address),
                 0,
                 null(),
-                NonNull::from(&data_size),
+                NonNull::from(&mut data_size),
             );
             check_os_status(status)?;
 
             let n_ranges = data_size as usize / mem::size_of::<AudioValueRange>();
-            let mut ranges: Vec<u8> = vec![];
-            ranges.reserve_exact(data_size as usize);
+            let mut ranges: Vec<AudioValueRange> = Vec::with_capacity(n_ranges);
             let status = AudioObjectGetPropertyData(
                 self.audio_device_id,
                 NonNull::from(&property_address),
                 0,
                 null(),
-                NonNull::from(&data_size),
+                NonNull::from(&mut data_size),
                 NonNull::new(ranges.as_mut_ptr()).unwrap().cast(),
             );
             check_os_status(status)?;
 
-            let ranges: *mut AudioValueRange = ranges.as_mut_ptr() as *mut _;
-            let ranges: &[AudioValueRange] = slice::from_raw_parts(ranges, n_ranges);
+            ranges.set_len(n_ranges);
 
             #[allow(non_upper_case_globals)]
             let input = match scope {
@@ -567,8 +571,8 @@ impl Device {
             } else if contains_different_sample_rates {
                 let res = ranges.iter().map(|range| SupportedStreamConfigRange {
                     channels: n_channels as ChannelCount,
-                    min_sample_rate: SampleRate(range.mMinimum as u32),
-                    max_sample_rate: SampleRate(range.mMaximum as u32),
+                    min_sample_rate: range.mMinimum as u32,
+                    max_sample_rate: range.mMaximum as u32,
                     buffer_size,
                     sample_format,
                 });
@@ -576,20 +580,16 @@ impl Device {
             } else {
                 let fmt = SupportedStreamConfigRange {
                     channels: n_channels as ChannelCount,
-                    min_sample_rate: SampleRate(
-                        ranges
-                            .iter()
-                            .map(|v| v.mMinimum as u32)
-                            .min()
-                            .expect("the list must not be empty"),
-                    ),
-                    max_sample_rate: SampleRate(
-                        ranges
-                            .iter()
-                            .map(|v| v.mMaximum as u32)
-                            .max()
-                            .expect("the list must not be empty"),
-                    ),
+                    min_sample_rate: ranges
+                        .iter()
+                        .map(|v| v.mMinimum as u32)
+                        .min()
+                        .expect("the list must not be empty"),
+                    max_sample_rate: ranges
+                        .iter()
+                        .map(|v| v.mMaximum as u32)
+                        .max()
+                        .expect("the list must not be empty"),
                     buffer_size,
                     sample_format,
                 };
@@ -649,13 +649,13 @@ impl Device {
 
         unsafe {
             let mut asbd: AudioStreamBasicDescription = mem::zeroed();
-            let data_size = mem::size_of::<AudioStreamBasicDescription>() as u32;
+            let mut data_size = mem::size_of::<AudioStreamBasicDescription>() as u32;
             let status = AudioObjectGetPropertyData(
                 self.audio_device_id,
                 NonNull::from(&property_address),
                 0,
                 null(),
-                NonNull::from(&data_size),
+                NonNull::from(&mut data_size),
                 NonNull::from(&mut asbd).cast(),
             );
             default_config_error_from_os_status(status)?;
@@ -693,7 +693,7 @@ impl Device {
             let buffer_size = get_io_buffer_frame_size_range(&audio_unit)?;
 
             let config = SupportedStreamConfig {
-                sample_rate: SampleRate(asbd.mSampleRate as _),
+                sample_rate: asbd.mSampleRate as _,
                 channels: asbd.mChannelsPerFrame as _,
                 buffer_size,
                 sample_format,
@@ -1011,9 +1011,10 @@ fn setup_callback_vars(
 fn get_device_buffer_frame_size(audio_unit: &AudioUnit) -> Result<usize, coreaudio::Error> {
     // Device-level property: always use Scope::Global + Element::Output
     // This is consistent with how we set the buffer size and query the buffer size range
-    audio_unit.get_property::<usize>(
+    let frames: u32 = audio_unit.get_property(
         kAudioDevicePropertyBufferFrameSize,
         Scope::Global,
         Element::Output,
-    )
+    )?;
+    Ok(frames as usize)
 }

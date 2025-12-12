@@ -1,3 +1,9 @@
+//! Device metadata and description types.
+//!
+//! This module provides structured information about audio devices including manufacturer,
+//! device type, interface type, and connection details. Not all backends provide complete
+//! information - availability depends on platform capabilities.
+
 use std::fmt;
 
 use crate::ChannelCount;
@@ -29,7 +35,7 @@ pub struct DeviceDescription {
     /// Physical address or connection identifier
     address: Option<String>,
 
-    /// Additional description lines with non-structured, detailed information
+    /// Additional description lines with non-structured, detailed information.
     extended: Vec<String>,
 }
 
@@ -70,6 +76,7 @@ pub enum DeviceType {
     /// Virtual/loopback device (software audio routing)
     Virtual,
 
+    //capture audio from screen
     ScreenCaptureKit,
 
     /// Unknown or unclassified device type
@@ -303,9 +310,9 @@ impl DeviceDescriptionBuilder {
             name: name.into(),
             manufacturer: None,
             driver: None,
-            device_type: DeviceType::Unknown,
-            interface_type: InterfaceType::Unknown,
-            direction: DeviceDirection::Unknown,
+            device_type: DeviceType::default(),
+            interface_type: InterfaceType::default(),
+            direction: DeviceDirection::default(),
             address: None,
             extended: Vec::new(),
         }
@@ -374,6 +381,16 @@ impl DeviceDescriptionBuilder {
     }
 }
 
+/// Determines device direction from input/output capabilities.
+pub(crate) fn direction_from_caps(has_input: bool, has_output: bool) -> DeviceDirection {
+    match (has_input, has_output) {
+        (true, true) => DeviceDirection::Duplex,
+        (true, false) => DeviceDirection::Input,
+        (false, true) => DeviceDirection::Output,
+        (false, false) => DeviceDirection::Unknown,
+    }
+}
+
 /// Determines device direction from input/output channel counts.
 #[allow(dead_code)]
 pub(crate) fn direction_from_counts(
@@ -382,11 +399,5 @@ pub(crate) fn direction_from_counts(
 ) -> DeviceDirection {
     let has_input = input_channels.map(|n| n > 0).unwrap_or(false);
     let has_output = output_channels.map(|n| n > 0).unwrap_or(false);
-
-    match (has_input, has_output) {
-        (true, true) => DeviceDirection::Duplex,
-        (true, false) => DeviceDirection::Input,
-        (false, true) => DeviceDirection::Output,
-        (false, false) => DeviceDirection::Unknown,
-    }
+    direction_from_caps(has_input, has_output)
 }

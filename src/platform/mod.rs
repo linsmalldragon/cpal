@@ -81,10 +81,56 @@ macro_rules! impl_platform_host {
         pub struct SupportedOutputConfigs(SupportedOutputConfigsInner);
 
         /// Unique identifier for available hosts on the platform.
+        ///
+        /// Only the hosts supported by the current platform are available as enum variants.
+        /// For cross-platform code that needs to handle hosts from other platforms,
+        /// use the string representation via [`std::fmt::Display`]/[`std::str::FromStr`].
+        ///
+        /// # Available Host Strings
+        ///
+        /// For cross-platform matching, these host strings are available:
+        ///
+        /// - `"aaudio"` - Android Audio
+        /// - `"alsa"` - Advanced Linux Sound Architecture
+        /// - `"asio"` - ASIO
+        /// - `"coreaudio"` - CoreAudio
+        /// - `"custom"` - Custom host (requires `custom` feature)
+        /// - `"emscripten"` - Emscripten
+        /// - `"jack"` - JACK Audio Connection Kit
+        /// - `"null"` - Null host
+        /// - `"wasapi"` - Windows Audio Session API
+        /// - `"webaudio"` - Web Audio API
+        /// - `"audioworklet"` - Audio Worklet
+        ///
+        /// # Cross-Platform Example
+        ///
+        /// ```
+        /// use cpal::HostId;
+        /// use std::str::FromStr;
+        ///
+        /// fn handle_host_string(host_string: &str) {
+        ///     // String matching works on all platforms
+        ///     match host_string {
+        ///         "alsa" => println!("ALSA host"),
+        ///         "coreaudio" => println!("CoreAudio host"),
+        ///         "jack" => println!("JACK host"),
+        ///         "wasapi" => println!("WASAPI host"),
+        ///         "asio" => println!("ASIO host"),
+        ///         "aaudio" => println!("AAudio host"),
+        ///         _ => println!("Other host"),
+        ///     }
+        ///
+        ///     // Parse host string (may fail if host is not available on this platform)
+        ///     if let Ok(host_id) = HostId::from_str(host_string) {
+        ///         println!("Successfully parsed: {}", host_id);
+        ///     }
+        /// }
+        /// ```
         #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
         pub enum HostId {
             $(
                 $(#[cfg($feat)])?
+                $(#[cfg_attr(docsrs, doc(cfg($feat)))])?
                 $HostVariant,
             )*
         }
@@ -146,6 +192,26 @@ macro_rules! impl_platform_host {
                         HostId::$HostVariant => stringify!($HostVariant),
                     )*
                 }
+            }
+        }
+
+        impl std::fmt::Display for HostId {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}", self.name().to_lowercase())
+            }
+        }
+
+        impl std::str::FromStr for HostId {
+            type Err = crate::HostUnavailable;
+
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                $(
+                    $(#[cfg($feat)])?
+                    if stringify!($HostVariant).eq_ignore_ascii_case(s) {
+                        return Ok(HostId::$HostVariant);
+                    }
+                )*
+                Err(crate::HostUnavailable)
             }
         }
 
@@ -623,8 +689,29 @@ macro_rules! impl_platform_host {
     target_os = "netbsd"
 ))]
 mod platform_impl {
+    #[cfg_attr(
+        docsrs,
+        doc(cfg(any(
+            target_os = "linux",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "netbsd"
+        )))
+    )]
     pub use crate::host::alsa::Host as AlsaHost;
     #[cfg(feature = "jack")]
+    #[cfg_attr(
+        docsrs,
+        doc(cfg(all(
+            any(
+                target_os = "linux",
+                target_os = "dragonfly",
+                target_os = "freebsd",
+                target_os = "netbsd"
+            ),
+            feature = "jack"
+        )))
+    )]
     pub use crate::host::jack::Host as JackHost;
 
     impl_platform_host!(
@@ -643,11 +730,15 @@ mod platform_impl {
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 mod platform_impl {
-    pub use crate::host::coreaudio::{
-        Device as CoreAudioDevice, Devices as CoreAudioDevices, Host as CoreAudioHost,
-        Stream as CoreAudioStream, SupportedInputConfigs as CoreAudioSupportedInputConfigs,
-        SupportedOutputConfigs as CoreAudioSupportedOutputConfigs,
-    };
+    #[cfg_attr(docsrs, doc(cfg(any(target_os = "macos", target_os = "ios"))))]
+    pub use crate::host::coreaudio::Host as CoreAudioHost;
+    #[cfg(feature = "jack")]
+    #[cfg_attr(
+        docsrs,
+        doc(cfg(all(any(target_os = "macos", target_os = "ios"), feature = "jack")))
+    )]
+    pub use crate::host::jack::Host as JackHost;
+
     #[cfg(any(target_os = "macos"))]
     pub use crate::host::screencapturekit::{
         Device as ScreenCaptureKitDevice, Devices as ScreenCaptureKitDevices,
@@ -655,9 +746,11 @@ mod platform_impl {
         SupportedInputConfigs as ScreenCaptureKitSupportedInputConfigs,
         SupportedOutputConfigs as ScreenCaptureKitSupportedOutputConfigs,
     };
+
     impl_platform_host!(
         CoreAudio => CoreAudioHost,
-        #[cfg(feature = "custom")] Custom => super::CustomHost,
+        #[cfg(feature = "jack")] Jack => JackHost,
+        #[cfg(feature = "custom")] Custom => super::CustomHost
         #[cfg(any(target_os = "macos"))] ScreenCaptureKit => super::ScreenCaptureKitHost
     );
 
@@ -671,6 +764,7 @@ mod platform_impl {
 
 #[cfg(target_os = "emscripten")]
 mod platform_impl {
+    #[cfg_attr(docsrs, doc(cfg(target_os = "emscripten")))]
     pub use crate::host::emscripten::Host as EmscriptenHost;
     impl_platform_host!(
         Emscripten => EmscriptenHost,
@@ -687,14 +781,26 @@ mod platform_impl {
 
 #[cfg(all(target_arch = "wasm32", feature = "wasm-bindgen"))]
 mod platform_impl {
+    #[cfg_attr(
+        docsrs,
+        doc(cfg(all(target_arch = "wasm32", feature = "wasm-bindgen")))
+    )]
     pub use crate::host::webaudio::Host as WebAudioHost;
 
-    #[cfg(feature = "web_audio_worklet")]
-    pub use crate::host::web_audio_worklet::Host as WebAudioWorkletHost;
+    #[cfg(feature = "audioworklet")]
+    #[cfg_attr(
+        docsrs,
+        doc(cfg(all(
+            target_arch = "wasm32",
+            feature = "wasm-bindgen",
+            feature = "audioworklet"
+        )))
+    )]
+    pub use crate::host::audioworklet::Host as AudioWorkletHost;
 
     impl_platform_host!(
         WebAudio => WebAudioHost,
-        #[cfg(feature = "web_audio_worklet")] WebAudioWorklet => WebAudioWorkletHost,
+        #[cfg(feature = "audioworklet")] AudioWorklet => AudioWorkletHost,
         #[cfg(feature = "custom")] Custom => super::CustomHost
     );
 
@@ -709,12 +815,18 @@ mod platform_impl {
 #[cfg(windows)]
 mod platform_impl {
     #[cfg(feature = "asio")]
+    #[cfg_attr(docsrs, doc(cfg(all(windows, feature = "asio"))))]
     pub use crate::host::asio::Host as AsioHost;
+    #[cfg(feature = "jack")]
+    #[cfg_attr(docsrs, doc(cfg(all(windows, feature = "jack"))))]
+    pub use crate::host::jack::Host as JackHost;
+    #[cfg_attr(docsrs, doc(cfg(windows)))]
     pub use crate::host::wasapi::Host as WasapiHost;
 
     impl_platform_host!(
         #[cfg(feature = "asio")] Asio => AsioHost,
         Wasapi => WasapiHost,
+        #[cfg(feature = "jack")] Jack => JackHost,
         #[cfg(feature = "custom")] Custom => super::CustomHost,
     );
 
@@ -728,6 +840,7 @@ mod platform_impl {
 
 #[cfg(target_os = "android")]
 mod platform_impl {
+    #[cfg_attr(docsrs, doc(cfg(target_os = "android")))]
     pub use crate::host::aaudio::Host as AAudioHost;
     impl_platform_host!(
         AAudio => AAudioHost,
@@ -755,6 +868,21 @@ mod platform_impl {
     all(target_arch = "wasm32", feature = "wasm-bindgen"),
 )))]
 mod platform_impl {
+    #[cfg_attr(
+        docsrs,
+        doc(cfg(not(any(
+            windows,
+            target_os = "linux",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "emscripten",
+            target_os = "android",
+            all(target_arch = "wasm32", feature = "wasm-bindgen")
+        ))))
+    )]
     pub use crate::host::null::Host as NullHost;
 
     impl_platform_host!(

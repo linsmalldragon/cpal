@@ -13,8 +13,6 @@ use std::sync::{Arc, Mutex};
 #[command(version, about = "CPAL record_wav example", long_about = None)]
 struct Opt {
     /// The audio device to use.
-    /// For the default microphone, use "default".
-    /// For recording system output, use "default-output".
     #[arg(short, long)]
     device: Option<String>,
 
@@ -162,7 +160,7 @@ fn sample_format(format: cpal::SampleFormat) -> hound::SampleFormat {
 fn wav_spec_from_config(config: &cpal::SupportedStreamConfig) -> hound::WavSpec {
     hound::WavSpec {
         channels: config.channels() as _,
-        sample_rate: config.sample_rate().0 as _,
+        sample_rate: config.sample_rate() as _,
         bits_per_sample: (config.sample_format().sample_size() * 8) as _,
         sample_format: sample_format(config.sample_format()),
     }

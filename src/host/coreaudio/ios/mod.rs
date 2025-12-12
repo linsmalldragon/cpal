@@ -5,7 +5,6 @@ use std::sync::Mutex;
 use coreaudio::audio_unit::render_callback::data;
 use coreaudio::audio_unit::{render_callback, AudioUnit, Element, Scope};
 use objc2_audio_toolbox::{kAudioOutputUnitProperty_EnableIO, kAudioUnitProperty_StreamFormat};
-use objc2_core_audio::kAudioDevicePropertyBufferFrameSize;
 use objc2_core_audio_types::AudioBuffer;
 
 use objc2_avf_audio::AVAudioSession;
@@ -25,7 +24,7 @@ use self::enumerate::{
     default_input_device, default_output_device, Devices, SupportedInputConfigs,
     SupportedOutputConfigs,
 };
-use std::slice;
+use std::ptr::NonNull;
 use std::time::Duration;
 
 pub mod enumerate;
@@ -33,7 +32,7 @@ pub mod enumerate;
 // These days the default of iOS is now F32 and no longer I16
 const SUPPORTED_SAMPLE_FORMAT: SampleFormat = SampleFormat::F32;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Device;
 
 pub struct Host;
@@ -83,7 +82,10 @@ impl Device {
     }
 
     fn id(&self) -> Result<DeviceId, DeviceIdError> {
-        Ok(DeviceId::CoreAudio("default".to_string()))
+        Ok(DeviceId(
+            crate::platform::HostId::CoreAudio,
+            "default".to_string(),
+        ))
     }
 
     fn supported_input_configs(
@@ -103,7 +105,7 @@ impl Device {
         get_supported_stream_configs(true)
             .next()
             .map(|range| range.with_max_sample_rate())
-            .ok_or_else(|| DefaultStreamConfigError::StreamTypeNotSupported)
+            .ok_or(DefaultStreamConfigError::StreamTypeNotSupported)
     }
 
     fn default_output_config(&self) -> Result<SupportedStreamConfig, DefaultStreamConfigError> {
@@ -111,7 +113,7 @@ impl Device {
         get_supported_stream_configs(false)
             .last()
             .map(|range| range.with_max_sample_rate())
-            .ok_or_else(|| DefaultStreamConfigError::StreamTypeNotSupported)
+            .ok_or(DefaultStreamConfigError::StreamTypeNotSupported)
     }
 }
 
@@ -321,7 +323,7 @@ fn set_audio_session_buffer_size(
     let audio_session = unsafe { AVAudioSession::sharedInstance() };
 
     // Calculate preferred buffer duration in seconds
-    let buffer_duration = buffer_size as f64 / sample_rate.0 as f64;
+    let buffer_duration = buffer_size as f64 / sample_rate as f64;
 
     // Set the preferred IO buffer duration
     // SAFETY: setPreferredIOBufferDuration_error is safe to call with valid duration
@@ -375,9 +377,9 @@ fn get_supported_stream_configs(is_input: bool) -> std::vec::IntoIter<SupportedS
     let configs: Vec<_> = (min_channels..=max_channels)
         .map(|channels| SupportedStreamConfigRange {
             channels,
-            min_sample_rate: SampleRate(sample_rate),
-            max_sample_rate: SampleRate(sample_rate),
-            buffer_size: buffer_size.clone(),
+            min_sample_rate: sample_rate,
+            max_sample_rate: sample_rate,
+            buffer_size,
             sample_format: SUPPORTED_SAMPLE_FORMAT,
         })
         .collect();
@@ -436,18 +438,24 @@ unsafe fn extract_audio_buffer(
 ) -> (AudioBuffer, Data) {
     let buffer = if is_input {
         // Input: access through buffer array
-        let ptr = (*args.data.data).mBuffers.as_ptr() as *const AudioBuffer;
-        let len = (*args.data.data).mNumberBuffers as usize;
-        let buffers: &[AudioBuffer] = slice::from_raw_parts(ptr, len);
-        buffers[0]
+        let first_buf_ptr = core::ptr::addr_of!((*args.data.data).mBuffers) as *const AudioBuffer;
+        core::ptr::read_unaligned(first_buf_ptr)
     } else {
         // Output: direct access
-        (*args.data.data).mBuffers[0]
+        let buf_ptr = core::ptr::addr_of!((*args.data.data).mBuffers[0]);
+        core::ptr::read_unaligned(buf_ptr)
     };
 
-    let data = buffer.mData as *mut ();
-    let len = (buffer.mDataByteSize as usize / bytes_per_channel) as usize;
-    let data = Data::from_parts(data, len, sample_format);
+    let mut data_ptr = buffer.mData as *mut ();
+    let mut len = buffer.mDataByteSize as usize / bytes_per_channel;
+
+    // SAFETY: slice::from_raw_parts requires a non-null pointer.
+    if data_ptr.is_null() {
+        data_ptr = NonNull::dangling().as_ptr();
+        len = 0;
+    }
+
+    let data = Data::from_parts(data_ptr, len, sample_format);
 
     (buffer, data)
 }
@@ -481,8 +489,14 @@ where
             Ok(cb) => cb,
         };
 
-        let latency_frames =
-            device_buffer_frames.unwrap_or_else(|| data.len() / buffer.mNumberChannels as usize);
+        let latency_frames = device_buffer_frames.unwrap_or_else(|| {
+            let channels = buffer.mNumberChannels as usize;
+            if channels > 0 {
+                data.len() / channels
+            } else {
+                0
+            }
+        });
         let delay = frames_to_duration(latency_frames, sample_rate);
         let capture = callback
             .sub(delay)
@@ -526,8 +540,14 @@ where
             Ok(cb) => cb,
         };
 
-        let latency_frames =
-            device_buffer_frames.unwrap_or_else(|| data.len() / buffer.mNumberChannels as usize);
+        let latency_frames = device_buffer_frames.unwrap_or_else(|| {
+            let channels = buffer.mNumberChannels as usize;
+            if channels > 0 {
+                data.len() / channels
+            } else {
+                0
+            }
+        });
         let delay = frames_to_duration(latency_frames, sample_rate);
         let playback = callback
             .add(delay)
