@@ -746,11 +746,10 @@ mod platform_impl {
         SupportedInputConfigs as ScreenCaptureKitSupportedInputConfigs,
         SupportedOutputConfigs as ScreenCaptureKitSupportedOutputConfigs,
     };
-
     impl_platform_host!(
         CoreAudio => CoreAudioHost,
         #[cfg(feature = "jack")] Jack => JackHost,
-        #[cfg(feature = "custom")] Custom => super::CustomHost
+        #[cfg(feature = "custom")] Custom => super::CustomHost,
         #[cfg(any(target_os = "macos"))] ScreenCaptureKit => super::ScreenCaptureKitHost
     );
 

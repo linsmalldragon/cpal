@@ -1,13 +1,7 @@
 use std::{cell::RefCell, rc::Rc, time::Duration};
 
 use crate::{
-    device_description::DeviceDescriptionBuilder,
-    traits::{DeviceTrait, HostTrait, StreamTrait},
-    BackendSpecificError, BuildStreamError, Data, DefaultStreamConfigError, DeviceDescription,
-    DeviceId, DeviceIdError, DeviceNameError, DevicesError, InputCallbackInfo, OutputCallbackInfo,
-    PauseStreamError, PlayStreamError, SampleFormat, SampleRate, StreamConfig, StreamError,
-    StreamInstant, SupportedBufferSize, SupportedStreamConfig, SupportedStreamConfigRange,
-    SupportedStreamConfigsError,
+    BackendSpecificError, BuildStreamError, Data, DefaultStreamConfigError, DeviceDescription, DeviceId, DeviceIdError, DeviceNameError, DevicesError, HostId, InputCallbackInfo, OutputCallbackInfo, PauseStreamError, PlayStreamError, SampleFormat, SampleRate, StreamConfig, StreamError, StreamInstant, SupportedBufferSize, SupportedStreamConfig, SupportedStreamConfigRange, SupportedStreamConfigsError, device_description::DeviceDescriptionBuilder, traits::{DeviceTrait, HostTrait, StreamTrait}
 };
 
 use cidre::{
@@ -80,7 +74,10 @@ impl DeviceTrait for Device {
     }
 
     fn id(&self) -> Result<DeviceId, DeviceIdError> {
-        Ok(DeviceId::ScreenCaptureKit(self.display.display_id()))
+        Ok(DeviceId(
+            HostId::ScreenCaptureKit,
+            self.display.display_id().to_string(),
+        ))
     }
 
     fn supported_input_configs(
@@ -154,8 +151,8 @@ impl Device {
         &self,
     ) -> Result<SupportedInputConfigs, SupportedStreamConfigsError> {
         let channels = 2;
-        let min_sample_rate = SampleRate(48000);
-        let max_sample_rate = SampleRate(48000);
+        let min_sample_rate: SampleRate = 48_000;
+        let max_sample_rate: SampleRate = 48_000;
         let buffer_size = SupportedBufferSize::Unknown;
         let sample_format = SampleFormat::F32;
         let supported_configs = vec![SupportedStreamConfigRange {
@@ -393,7 +390,7 @@ fn host_time_to_stream_instant(cm_time: cm::Time) -> StreamInstant {
 }
 
 fn frames_to_duration(frames: usize, rate: crate::SampleRate) -> std::time::Duration {
-    let secsf = frames as f64 / rate.0 as f64;
+    let secsf = frames as f64 / rate as f64;
     let secs = secsf as u64;
     let nanos = ((secsf - secs as f64) * 1_000_000_000.0) as u32;
     std::time::Duration::new(secs, nanos)

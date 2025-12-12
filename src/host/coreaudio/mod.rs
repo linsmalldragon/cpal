@@ -25,6 +25,7 @@ pub use self::ios::{
 };
 
 #[cfg(target_os = "macos")]
+#[allow(unused_imports)]
 pub use self::macos::{
     enumerate::{Devices, SupportedInputConfigs, SupportedOutputConfigs},
     Device, Host, Stream,
