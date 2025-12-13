@@ -1,14 +1,44 @@
-use std::{cell::RefCell, rc::Rc, time::Duration};
+use std::time::Duration;
+use std::{cell::RefCell, rc::Rc};
 
 use crate::{
-    BackendSpecificError, BuildStreamError, Data, DefaultStreamConfigError, DeviceDescription, DeviceId, DeviceIdError, DeviceNameError, DevicesError, HostId, InputCallbackInfo, OutputCallbackInfo, PauseStreamError, PlayStreamError, SampleFormat, SampleRate, StreamConfig, StreamError, StreamInstant, SupportedBufferSize, SupportedStreamConfig, SupportedStreamConfigRange, SupportedStreamConfigsError, device_description::DeviceDescriptionBuilder, traits::{DeviceTrait, HostTrait, StreamTrait}
+    device_description::DeviceDescriptionBuilder,
+    traits::{DeviceTrait, HostTrait, StreamTrait},
+    BackendSpecificError, BuildStreamError, Data, DefaultStreamConfigError, DeviceDescription,
+    DeviceId, DeviceIdError, DeviceNameError, DevicesError, HostId, InputCallbackInfo,
+    OutputCallbackInfo, PauseStreamError, PlayStreamError, SampleFormat, SampleRate, StreamConfig,
+    StreamError, StreamInstant, SupportedBufferSize, SupportedStreamConfig,
+    SupportedStreamConfigRange, SupportedStreamConfigsError,
 };
 
-use cidre::{
-    arc::Retained,
-    cm, define_obj_type, dispatch, ns, objc,
-    sc::{self, StreamOutput, StreamOutputImpl},
+use block2::RcBlock;
+use objc2::rc::{Allocated, Retained};
+use objc2::{class, define_class, msg_send, ClassType, DefinedClass};
+use objc2_core_media::{CMSampleBuffer, CMTime};
+use objc2_foundation::{NSArray, NSError, NSObject, NSObjectProtocol};
+use objc2_screen_capture_kit::{
+    SCContentFilter, SCDisplay, SCRunningApplication, SCStream, SCStreamConfiguration,
+    SCStreamOutput, SCStreamOutputType,
 };
+
+impl Capturer {
+    pub fn new(inner: CapturerInner) -> Retained<Self> {
+        unsafe {
+            // Workaround: msg_send! infers Retained, but we need Allocated.
+            // Both are transparent wrappers around NonNull.
+            let ptr: *mut Self = msg_send![Self::class(), alloc];
+            let alloc: Allocated<Self> = std::mem::transmute(ptr);
+            // set_ivars returns PartialInit<Self>
+            let partial = alloc.set_ivars(RefCell::new(inner));
+            // Workaround: Transmute PartialInit back to Allocated or use it directly
+            // If MsgSend fails for PartialInit, casting to Allocated might help
+            let alloc_again: Allocated<Self> = std::mem::transmute(partial);
+            let obj: Option<Retained<Self>> = msg_send![alloc_again, init];
+            obj.expect("Capturer init failed")
+        }
+    }
+}
+
 pub use enumerate::{
     default_input_device, default_output_device, Devices, SupportedInputConfigs,
     SupportedOutputConfigs,
@@ -27,7 +57,6 @@ impl Host {
 
 impl HostTrait for Host {
     type Devices = Devices;
-
     type Device = Device;
 
     fn is_available() -> bool {
@@ -50,22 +79,21 @@ impl HostTrait for Host {
 
 #[derive(Clone)]
 pub struct Device {
-    display: Retained<sc::Display>,
+    display: Retained<SCDisplay>,
+    excluded_apps: Vec<Retained<SCRunningApplication>>,
 }
 
 impl DeviceTrait for Device {
     type SupportedInputConfigs = SupportedInputConfigs;
-
     type SupportedOutputConfigs = SupportedOutputConfigs;
-
     type Stream = Stream;
 
     fn name(&self) -> Result<String, DeviceNameError> {
-        Ok(self.name().clone())
+        Ok(self.name_impl())
     }
 
     fn description(&self) -> Result<DeviceDescription, DeviceNameError> {
-        let name = self.name();
+        let name = self.name_impl();
         Ok(DeviceDescriptionBuilder::new(name)
             .device_type(crate::device_description::DeviceType::ScreenCaptureKit)
             .interface_type(crate::device_description::InterfaceType::Unknown)
@@ -74,10 +102,9 @@ impl DeviceTrait for Device {
     }
 
     fn id(&self) -> Result<DeviceId, DeviceIdError> {
-        Ok(DeviceId(
-            HostId::ScreenCaptureKit,
-            self.display.display_id().0.to_string(),
-        ))
+        // SCDisplay usually has displayID property
+        let id = unsafe { self.display.displayID() };
+        Ok(DeviceId(HostId::ScreenCaptureKit, id.to_string()))
     }
 
     fn supported_input_configs(
@@ -139,12 +166,20 @@ impl DeviceTrait for Device {
 }
 
 impl Device {
-    pub fn new(display: Retained<sc::Display>) -> Self {
-        Self { display }
+    pub fn new(display: Retained<SCDisplay>) -> Self {
+        Self {
+            display,
+            excluded_apps: Vec::new(),
+        }
     }
 
-    fn name(&self) -> String {
-        format!("Display {}", self.display.display_id().0)
+    pub fn set_excluded_apps(&mut self, apps: &[Retained<SCRunningApplication>]) {
+        self.excluded_apps = apps.to_vec();
+    }
+
+    fn name_impl(&self) -> String {
+        let id = unsafe { self.display.displayID() };
+        format!("Display {}", id)
     }
 
     fn supported_input_configs(
@@ -195,13 +230,45 @@ impl Device {
         D: FnMut(&Data, &InputCallbackInfo) + Send + 'static,
         E: FnMut(StreamError) + Send + 'static,
     {
-        let queue = dispatch::Queue::serial_with_ar_pool();
-        let mut cfg = sc::StreamCfg::new();
-        cfg.set_captures_audio(true);
-        cfg.set_excludes_current_process_audio(false);
-        let windows = ns::Array::new();
-        let filter = sc::ContentFilter::with_display_excluding_windows(&self.display, &windows);
-        let sc_stream = sc::Stream::new(&filter, &cfg);
+        use objc2::class;
+        use objc2::rc::Allocated;
+
+        let cfg = unsafe { SCStreamConfiguration::new() };
+        unsafe {
+            cfg.setCapturesAudio(true);
+            cfg.setExcludesCurrentProcessAudio(false);
+        }
+
+        let windows = NSArray::new();
+
+        let filter: Retained<SCContentFilter> = if self.excluded_apps.is_empty() {
+            unsafe {
+                let ptr: *mut SCContentFilter = msg_send![class!(SCContentFilter), alloc];
+                let alloc: Allocated<SCContentFilter> = std::mem::transmute(ptr);
+                SCContentFilter::initWithDisplay_excludingWindows(alloc, &self.display, &windows)
+            }
+        } else {
+            let apps_refs: Vec<&SCRunningApplication> =
+                self.excluded_apps.iter().map(|a| &**a).collect();
+            let excluded_apps = NSArray::from_slice(&apps_refs);
+            unsafe {
+                let ptr: *mut SCContentFilter = msg_send![class!(SCContentFilter), alloc];
+                let alloc: Allocated<SCContentFilter> = std::mem::transmute(ptr);
+                SCContentFilter::initWithDisplay_excludingApplications_exceptingWindows(
+                    alloc,
+                    &self.display,
+                    &excluded_apps,
+                    &windows,
+                )
+            }
+        };
+
+        let sc_stream = unsafe {
+            let ptr: *mut SCStream = msg_send![class!(SCStream), alloc];
+            let alloc: Allocated<SCStream> = std::mem::transmute(ptr);
+            SCStream::initWithFilter_configuration_delegate(alloc, &filter, &cfg, None)
+        };
+
         let inner = CapturerInner {
             current_data: vec![],
             config: config.clone(),
@@ -209,12 +276,38 @@ impl Device {
             data_callback: Box::new(data_callback),
             error_callback: Box::new(error_callback),
         };
-        let capturer = Capturer::with(inner);
-        sc_stream
-            .add_stream_output(capturer.as_ref(), sc::OutputType::Audio, Some(&queue))
-            .map_err(|e| BackendSpecificError {
-                description: format!("{e}"),
-            })?;
+
+        let capturer = Capturer::new(inner);
+
+        // Dispatch queue handling
+        let label = std::ffi::CString::new("cpal.screencapturekit.queue").unwrap();
+        let queue = unsafe { dispatch_queue_create(label.as_ptr(), std::ptr::null_mut()) };
+
+        unsafe {
+            let queue_obj: *mut objc2::runtime::AnyObject = queue as _;
+            let queue_retained: Retained<objc2::runtime::AnyObject> =
+                Retained::from_raw(queue_obj).unwrap();
+
+            let mut error: *mut NSError = std::ptr::null_mut();
+            let success: bool = msg_send![
+                &sc_stream,
+                addStreamOutput: &*capturer,
+                type: SCStreamOutputType::Audio,
+                sampleHandlerQueue: &*queue_retained,
+                error: &mut error
+            ];
+
+            if !success {
+                let err = if !error.is_null() {
+                    Retained::retain(error)
+                        .map(|e| format!("{:?}", e))
+                        .unwrap_or_else(|| "Unknown error".to_string())
+                } else {
+                    "Unknown SCStream error".to_string()
+                };
+                return Err(BackendSpecificError { description: err }.into());
+            }
+        }
 
         Ok(Stream::new(StreamInner {
             _capturer: capturer,
@@ -242,7 +335,7 @@ impl Device {
 struct StreamInner {
     // Keep capturer alive
     _capturer: Retained<Capturer>,
-    sc_stream: Retained<sc::Stream>,
+    sc_stream: Retained<SCStream>,
     playing: bool,
 }
 
@@ -264,16 +357,26 @@ impl StreamTrait for Stream {
         let mut stream = self.inner.borrow_mut();
         if !stream.playing {
             let (tx, rx) = std::sync::mpsc::channel();
-            stream.sc_stream.start_with_ch(move |e| {
-                let res = if let Some(e) = e {
-                    Result::Err(BackendSpecificError {
-                        description: format!("{e}"),
-                    })
+
+            // SCStream uses completion handler blocks
+            let handler = RcBlock::new(move |error: *mut NSError| {
+                if !error.is_null() {
+                    let err = unsafe { Retained::retain(error) };
+                    tx.send(Err(BackendSpecificError {
+                        description: format!("{:?}", err),
+                    }))
+                    .unwrap();
                 } else {
-                    Result::Ok(())
-                };
-                tx.send(res).unwrap();
+                    tx.send(Ok(())).unwrap();
+                }
             });
+
+            unsafe {
+                stream
+                    .sc_stream
+                    .startCaptureWithCompletionHandler(Some(&handler));
+            }
+
             rx.recv().unwrap()?;
             stream.playing = true;
         }
@@ -284,16 +387,25 @@ impl StreamTrait for Stream {
         let mut stream = self.inner.borrow_mut();
         if stream.playing {
             let (tx, rx) = std::sync::mpsc::channel();
-            stream.sc_stream.stop_with_ch(move |e| {
-                let res = if let Some(e) = e {
-                    Result::Err(BackendSpecificError {
-                        description: format!("{e}"),
-                    })
+
+            let handler = RcBlock::new(move |error: *mut NSError| {
+                if !error.is_null() {
+                    let err = unsafe { Retained::retain(error) };
+                    tx.send(Err(BackendSpecificError {
+                        description: format!("{:?}", err),
+                    }))
+                    .unwrap();
                 } else {
-                    Result::Ok(())
-                };
-                tx.send(res).unwrap();
+                    tx.send(Ok(())).unwrap();
+                }
             });
+
+            unsafe {
+                stream
+                    .sc_stream
+                    .stopCaptureWithCompletionHandler(Some(&handler));
+            }
+
             rx.recv().unwrap()?;
             stream.playing = false;
         }
@@ -301,8 +413,8 @@ impl StreamTrait for Stream {
     }
 }
 
-#[repr(C)]
-struct CapturerInner {
+#[allow(dead_code)]
+pub struct CapturerInner {
     current_data: Vec<f32>,
     config: StreamConfig,
     sample_format: SampleFormat,
@@ -310,88 +422,135 @@ struct CapturerInner {
     error_callback: Box<dyn FnMut(StreamError) + Send + 'static>,
 }
 
-impl CapturerInner {
-    fn handle_audio(&mut self, sample_buf: &mut cm::SampleBuf) {
-        let start = std::time::Instant::now();
-        // Assume 2 channels
-        let buf_list = match sample_buf.audio_buf_list::<2>() {
-            Ok(res) => res,
-            Err(e) => {
-                (self.error_callback)(StreamError::BackendSpecific {
-                    err: BackendSpecificError {
-                        description: format!("{e}"),
-                    },
-                });
-                return;
-            }
-        };
-        let buf_list = buf_list.list();
-        let buf_cnt = buf_list.number_buffers as usize;
-        let buf_len =
-            buf_list.buffers[0].data_bytes_size as usize / self.sample_format.sample_size();
-        let required_len = buf_cnt * buf_len;
+define_class!(
+    #[unsafe(super(NSObject))]
+    #[name = "CpalScreencaptureKitCapturer"]
+    #[ivars = RefCell<CapturerInner>]
+    pub struct Capturer;
 
-        if required_len > self.current_data.len() {
-            self.current_data.resize(required_len, 0.0);
-        }
+    unsafe impl NSObjectProtocol for Capturer {}
 
-        for (i, buf) in buf_list.buffers.iter().enumerate() {
-            // Assume f32 sample format
-            let buf_data = unsafe { std::slice::from_raw_parts(buf.data as *const f32, buf_len) };
-            for (item, v) in self
-                .current_data
-                .iter_mut()
-                .skip(i)
-                .step_by(2)
-                .zip(buf_data.iter())
-            {
-                *item = *v;
+    unsafe impl SCStreamOutput for Capturer {
+        #[unsafe(method(stream:didOutputSampleBuffer:ofType:))]
+        fn stream_did_output_sample_buffer_of_type(
+            &self,
+            _stream: &SCStream,
+            sample_buffer: &CMSampleBuffer,
+            kind: SCStreamOutputType,
+        ) {
+            if kind == SCStreamOutputType::Audio {
+                let mut inner = self.ivars().borrow_mut();
+                inner.handle_audio(sample_buffer);
             }
         }
-
-        let data = self.current_data.as_mut_ptr() as *mut ();
-        let data = unsafe { Data::from_parts(data, required_len, self.sample_format) };
-
-        let capture = host_time_to_stream_instant(sample_buf.pts());
-        let duration = frames_to_duration(buf_len, self.config.sample_rate);
-        let elapsed = start.elapsed();
-        let callback = capture.add(duration).unwrap().add(elapsed).unwrap();
-        let timestamp = crate::InputStreamTimestamp { callback, capture };
-        let info = InputCallbackInfo { timestamp };
-        (self.data_callback)(&data, &info);
     }
-}
+);
 
-define_obj_type!(Capturer + StreamOutputImpl, CapturerInner, CAPTURER);
+// ...
 
-impl StreamOutput for Capturer {}
+// ...
 
-#[objc::add_methods]
-impl StreamOutputImpl for Capturer {
-    extern "C" fn impl_stream_did_output_sample_buf(
-        &mut self,
-        _cmd: Option<&cidre::objc::Sel>,
-        _stream: &sc::Stream,
-        sample_buf: &mut cm::SampleBuf,
-        kind: sc::OutputType,
-    ) {
-        match kind {
-            sc::OutputType::Audio => self.inner_mut().handle_audio(sample_buf),
-            _ => {}
-        }
-    }
-}
+// ... FFI ...
 
-fn host_time_to_stream_instant(cm_time: cm::Time) -> StreamInstant {
-    let secs = cm_time.value / cm_time.scale as i64;
-    let subsec_nanos =
-        (cm_time.value % cm_time.scale as i64) * 1_000_000_000 / cm_time.scale as i64;
-    StreamInstant::new(secs, subsec_nanos as u32)
-}
+// ...
 
+#[allow(unused)]
 fn frames_to_duration(frames: usize, rate: crate::SampleRate) -> std::time::Duration {
-    let secsf = frames as f64 / rate as f64;
+    // rate is u32
+    // Trying to remove .0 again. If this fails I'll be very sad.
+    let secsf = frames as f64 / (rate as f64);
     let secs = secsf as u64;
     let nanos = ((secsf - secs as f64) * 1_000_000_000.0) as u32;
     std::time::Duration::new(secs, nanos)
+}
+
+// Manual FFI bindings
+#[link(name = "CoreMedia", kind = "framework")]
+extern "C" {
+    fn CMSampleBufferGetNumSamples(sbuf: &CMSampleBuffer) -> std::ffi::c_long;
+    fn CMSampleBufferGetPresentationTimeStamp(sbuf: &CMSampleBuffer) -> CMTime;
+    fn CMSampleBufferGetDataBuffer(sbuf: &CMSampleBuffer) -> *mut std::ffi::c_void;
+    fn CMBlockBufferGetDataPointer(
+        theBuffer: *mut std::ffi::c_void,
+        offset: usize,
+        lengthAtOffsetOut: *mut usize,
+        totalLengthOut: *mut usize,
+        dataPointerOut: *mut *mut u8,
+    ) -> i32;
+}
+
+#[link(name = "System", kind = "dylib")]
+extern "C" {
+    fn dispatch_queue_create(
+        label: *const i8,
+        attr: *mut std::ffi::c_void,
+    ) -> *mut std::ffi::c_void;
+}
+
+impl CapturerInner {
+    fn handle_audio(&mut self, sample_buf: &CMSampleBuffer) {
+        unsafe {
+            let num_samples = CMSampleBufferGetNumSamples(sample_buf) as usize;
+            if num_samples == 0 {
+                return;
+            }
+
+            let timestamp = CMSampleBufferGetPresentationTimeStamp(sample_buf);
+            let instant = host_time_to_stream_instant(timestamp);
+
+            let block_buffer = CMSampleBufferGetDataBuffer(sample_buf);
+            if block_buffer.is_null() {
+                return;
+            }
+
+            let mut length_at_offset = 0;
+            let mut total_length = 0;
+            let mut data_ptr: *mut u8 = std::ptr::null_mut();
+
+            let status = CMBlockBufferGetDataPointer(
+                block_buffer,
+                0,
+                &mut length_at_offset,
+                &mut total_length,
+                &mut data_ptr,
+            );
+
+            if status != 0 {
+                return;
+            }
+
+            // ScreenCaptureKit defaults: F32, 2ch, 48kHz.
+            // We assume valid length for now.
+
+            // Assume aligned f32
+            let float_ptr = data_ptr as *const f32;
+            let floats_len = total_length / 4;
+            let samples = std::slice::from_raw_parts(float_ptr, floats_len);
+
+            self.current_data.resize(floats_len, 0.0);
+            self.current_data.copy_from_slice(samples);
+
+            // Callback
+            let callback_info = InputCallbackInfo {
+                timestamp: crate::InputStreamTimestamp {
+                    callback: instant,
+                    capture: instant,
+                },
+            };
+
+            let cpal_data = Data::from_parts(
+                self.current_data.as_mut_ptr() as *mut _,
+                self.current_data.len(),
+                SampleFormat::F32,
+            );
+            (self.data_callback)(&cpal_data, &callback_info);
+        }
+    }
+}
+
+fn host_time_to_stream_instant(cm_time: CMTime) -> StreamInstant {
+    let secs = cm_time.value / cm_time.timescale as i64;
+    let subsec_nanos =
+        (cm_time.value % cm_time.timescale as i64) * 1_000_000_000 / cm_time.timescale as i64;
+    StreamInstant::new(secs, subsec_nanos as u32)
 }
