@@ -17,9 +17,9 @@ fn main() -> Result<(), anyhow::Error> {
 
 #[cfg(target_os = "macos")]
 fn run_macos_example() -> Result<(), anyhow::Error> {
-    use cpal::platform::{ScreenCaptureKitDevice, ScreenCaptureKitDevices};
+    use cpal::platform::ScreenCaptureKitDevice;
 
-    println!("=== ScreenCaptureKit Performance Timing ===\n");
+    println!("=== ScreenCaptureKit Audio Capture with App Filtering ===\n");
 
     // 1. Get ScreenCaptureKit Host
     let t0 = Instant::now();
@@ -29,89 +29,41 @@ fn run_macos_example() -> Result<(), anyhow::Error> {
 
     println!("Host: {:?}", host.id());
 
-    // 2. enumerate devices
+    // 2. Get default input device
     let t1 = Instant::now();
-    let devices = host.devices()?;
-    println!("[TIMING] devices() call: {:?}", t1.elapsed());
-
-    let t2 = Instant::now();
-    println!("Available devices:");
-    for device in devices {
-        println!("  - {}", device.description()?.name());
-    }
-    println!("[TIMING] Iterating devices: {:?}", t2.elapsed());
-
-    // 3. Get available applications and find QQ Music
-    println!("\n=== Finding QQ Music to exclude ===");
-    let t_apps = Instant::now();
-    let apps = ScreenCaptureKitDevices::available_applications()?;
-    println!("[TIMING] available_applications(): {:?}", t_apps.elapsed());
-
-    println!("Running applications ({} total):", apps.len());
-    let mut excluded_apps = Vec::new();
-
-    for app in &apps {
-        let bundle_id = unsafe { app.bundleIdentifier().to_string() };
-        let app_name = unsafe { app.applicationName().to_string() };
-
-        // Print all apps for debugging
-        if app_name.contains("QQ音乐") {
-            println!("  🎵 [FOUND] {} ({})", app_name, bundle_id);
-            excluded_apps.push(app.clone());
-        }
-    }
-
-    if excluded_apps.is_empty() {
-        println!("  ⚠️ QQ Music not found! Please start QQ Music and try again.");
-        println!("  Looking for apps with 'QQ' or 'tencent' in name/bundle ID...");
-
-        // Show some apps for reference
-        for app in apps.iter().take(10) {
-            let bundle_id = unsafe { app.bundleIdentifier().to_string() };
-            let app_name = unsafe { app.applicationName().to_string() };
-            println!("    - {} ({})", app_name, bundle_id);
-        }
-    } else {
-        println!("\n  ✅ Found {} app(s) to exclude", excluded_apps.len());
-    }
-
-    // 4. Get default input device and set excluded apps
-    let t3 = Instant::now();
     let device = host
         .default_input_device()
         .expect("No input device available");
-    println!("[TIMING] default_input_device(): {:?}", t3.elapsed());
+    println!("[TIMING] default_input_device(): {:?}", t1.elapsed());
 
-    // Convert to ScreenCaptureKitDevice to access set_excluded_apps
+    // Convert to ScreenCaptureKitDevice to access set_excluded_app_names
     let mut sck_device: ScreenCaptureKitDevice = match device.into_inner() {
         cpal::platform::DeviceInner::ScreenCaptureKit(d) => d,
         _ => panic!("Expected ScreenCaptureKit device"),
     };
 
-    // Set excluded apps (QQ Music)
-    if !excluded_apps.is_empty() {
-        sck_device.set_excluded_apps(&excluded_apps);
-        println!(
-            "\n🔇 Excluding {} app(s) from audio capture",
-            excluded_apps.len()
-        );
-    }
+    // 3. Set excluded apps by name (the new simple API!)
+    //    第一次调用 build_input_stream 时会自动获取并缓存应用列表
+    println!("\n=== Setting up app exclusion ===");
+    let excluded_apps = ["QQ音乐"]; // 只排除 QQ音乐
+    sck_device.set_excluded_app_names(&excluded_apps);
+    println!("🔇 Will exclude apps matching: {:?}", excluded_apps);
 
     println!("Selected device: {}", sck_device.description()?.name());
 
-    // 5. Configure stream
-    let t4 = Instant::now();
+    // 4. Configure stream
+    let t2 = Instant::now();
     let supported_config = sck_device.default_input_config().unwrap();
-    println!("[TIMING] default_input_config(): {:?}", t4.elapsed());
+    println!("[TIMING] default_input_config(): {:?}", t2.elapsed());
 
     println!("Default config: {:?}", supported_config);
     let sample_format = supported_config.sample_format();
 
     let config: cpal::StreamConfig = supported_config.into();
 
-    // 6. Build input stream
-    let t5 = Instant::now();
-    println!("Building input stream...");
+    // 5. Build input stream (app names will be matched against cached apps here)
+    let t3 = Instant::now();
+    println!("\nBuilding input stream (will fetch app list if not cached)...");
     let stream = sck_device.build_input_stream_raw(
         &config,
         sample_format,
@@ -134,18 +86,18 @@ fn run_macos_example() -> Result<(), anyhow::Error> {
         },
         None, // Timeout
     )?;
+    println!("[TIMING] build_input_stream_raw(): {:?}", t3.elapsed());
 
     println!("Stream built. Playing...");
-    println!("[TIMING] build_input_stream_raw(): {:?}", t5.elapsed());
 
-    let t6 = Instant::now();
+    let t4 = Instant::now();
     stream.play()?;
-    println!("[TIMING] stream.play(): {:?}", t6.elapsed());
+    println!("[TIMING] stream.play(): {:?}", t4.elapsed());
 
     println!("\n=== Total initialization time: {:?} ===\n", t0.elapsed());
 
     println!("Recording for 10 seconds...");
-    println!("🔊 If QQ Music is playing, you should see NO audio output (RMS values)");
+    println!("🔊 If QQ音乐 is playing, you should see NO audio output");
     println!("🔊 If other apps are playing audio, you WILL see their audio\n");
     std::thread::sleep(std::time::Duration::from_secs(10));
 

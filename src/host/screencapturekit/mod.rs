@@ -81,6 +81,8 @@ impl HostTrait for Host {
 pub struct Device {
     display: Retained<SCDisplay>,
     excluded_apps: Vec<Retained<SCRunningApplication>>,
+    /// App names to exclude (matched at stream build time)
+    excluded_app_names: Vec<String>,
 }
 
 impl DeviceTrait for Device {
@@ -170,11 +172,31 @@ impl Device {
         Self {
             display,
             excluded_apps: Vec::new(),
+            excluded_app_names: Vec::new(),
         }
     }
 
+    /// Set excluded apps by SCRunningApplication references (advanced API)
     pub fn set_excluded_apps(&mut self, apps: &[Retained<SCRunningApplication>]) {
         self.excluded_apps = apps.to_vec();
+    }
+
+    /// Set excluded apps by name (simple API, recommended)
+    ///
+    /// App names are matched against running applications when building the stream.
+    /// Uses a cached list of running apps for performance.
+    ///
+    /// # Example
+    /// ```ignore
+    /// device.set_excluded_app_names(&["QQ音乐", "微信"]);
+    /// ```
+    pub fn set_excluded_app_names(&mut self, names: &[&str]) {
+        self.excluded_app_names = names.iter().map(|s| s.to_string()).collect();
+    }
+
+    /// Get the list of excluded app names
+    pub fn excluded_app_names(&self) -> &[String] {
+        &self.excluded_app_names
     }
 
     fn name_impl(&self) -> String {
@@ -241,7 +263,26 @@ impl Device {
 
         let windows = NSArray::new();
 
-        let filter: Retained<SCContentFilter> = if self.excluded_apps.is_empty() {
+        // Resolve excluded app names to SCRunningApplication objects
+        let all_excluded_apps: Vec<Retained<SCRunningApplication>> =
+            if !self.excluded_app_names.is_empty() {
+                // Get cached applications list
+                let apps = enumerate::get_applications_cached().unwrap_or_default();
+
+                // Match app names
+                apps.into_iter()
+                    .filter(|app| {
+                        let app_name = unsafe { app.applicationName().to_string() };
+                        self.excluded_app_names
+                            .iter()
+                            .any(|name| app_name.contains(name.as_str()))
+                    })
+                    .collect()
+            } else {
+                self.excluded_apps.clone()
+            };
+
+        let filter: Retained<SCContentFilter> = if all_excluded_apps.is_empty() {
             unsafe {
                 let ptr: *mut SCContentFilter = msg_send![class!(SCContentFilter), alloc];
                 let alloc: Allocated<SCContentFilter> = std::mem::transmute(ptr);
@@ -249,7 +290,7 @@ impl Device {
             }
         } else {
             let apps_refs: Vec<&SCRunningApplication> =
-                self.excluded_apps.iter().map(|a| &**a).collect();
+                all_excluded_apps.iter().map(|a| &**a).collect();
             let excluded_apps = NSArray::from_slice(&apps_refs);
             unsafe {
                 let ptr: *mut SCContentFilter = msg_send![class!(SCContentFilter), alloc];

@@ -13,7 +13,7 @@ use crate::{BackendSpecificError, DevicesError, SupportedStreamConfigRange};
 use super::Device;
 
 // ============================================================================
-// Thread-local cache for SCShareableContent
+// Thread-local cache for displays and running applications
 // ============================================================================
 //
 // 为什么使用 thread_local! 而不是 static Mutex:
@@ -28,6 +28,7 @@ use super::Device;
 //
 thread_local! {
     static DISPLAY_CACHE: RefCell<Option<Vec<Retained<SCDisplay>>>> = const { RefCell::new(None) };
+    static APPS_CACHE: RefCell<Option<Vec<Retained<SCRunningApplication>>>> = const { RefCell::new(None) };
 }
 
 /// Fetch displays from macOS (blocking call ~90ms)
@@ -46,6 +47,44 @@ fn fetch_displays() -> Result<Vec<Retained<SCDisplay>>, DevicesError> {
                 let displays = unsafe { content.displays() };
                 let display_vec: Vec<Retained<SCDisplay>> = displays.iter().collect();
                 let _ = tx.send(Ok(display_vec));
+            } else {
+                let _ = tx.send(Err(BackendSpecificError {
+                    description: "Unknown error: content and error are both null".to_string(),
+                }));
+            }
+        },
+    );
+
+    unsafe {
+        SCShareableContent::getShareableContentWithCompletionHandler(&handler);
+    }
+
+    // Add timeout for stability
+    match rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(result) => result.map_err(|e| e.into()),
+        Err(_) => Err(BackendSpecificError {
+            description: "Timeout waiting for SCShareableContent".to_string(),
+        }
+        .into()),
+    }
+}
+
+/// Fetch running applications from macOS (blocking call ~90ms)
+fn fetch_applications() -> Result<Vec<Retained<SCRunningApplication>>, DevicesError> {
+    let (tx, rx) = channel();
+
+    let handler = RcBlock::new(
+        move |content: *mut SCShareableContent, error: *mut NSError| {
+            if !error.is_null() {
+                let err = unsafe { Retained::retain(error) };
+                let _ = tx.send(Err(BackendSpecificError {
+                    description: format!("{:?}", err),
+                }));
+            } else if !content.is_null() {
+                let content = unsafe { Retained::retain(content).unwrap() };
+                let apps = unsafe { content.applications() };
+                let apps_vec: Vec<Retained<SCRunningApplication>> = apps.iter().collect();
+                let _ = tx.send(Ok(apps_vec));
             } else {
                 let _ = tx.send(Err(BackendSpecificError {
                     description: "Unknown error: content and error are both null".to_string(),
@@ -88,10 +127,50 @@ fn get_displays_cached() -> Result<Vec<Retained<SCDisplay>>, DevicesError> {
     Ok(displays)
 }
 
-/// Invalidate the thread-local cache (call when display configuration changes)
+/// Get running applications with thread-local caching (fast on cache hit)
+/// This is called internally when building a stream with app name exclusions
+pub(crate) fn get_applications_cached() -> Result<Vec<Retained<SCRunningApplication>>, DevicesError>
+{
+    // Check thread-local cache first
+    let cached = APPS_CACHE.with(|cache| cache.borrow().clone());
+
+    if let Some(apps) = cached {
+        return Ok(apps);
+    }
+
+    // Cache miss - fetch new content
+    let apps = fetch_applications()?;
+
+    // Update thread-local cache
+    APPS_CACHE.with(|cache| {
+        *cache.borrow_mut() = Some(apps.clone());
+    });
+
+    Ok(apps)
+}
+
+/// Refresh the applications cache (call if you need fresh app list)
+#[allow(dead_code)]
+pub fn refresh_applications_cache() -> Result<(), DevicesError> {
+    let apps = fetch_applications()?;
+    APPS_CACHE.with(|cache| {
+        *cache.borrow_mut() = Some(apps);
+    });
+    Ok(())
+}
+
+/// Invalidate the thread-local display cache
 #[allow(dead_code)]
 pub fn invalidate_display_cache() {
     DISPLAY_CACHE.with(|cache| {
+        *cache.borrow_mut() = None;
+    });
+}
+
+/// Invalidate the thread-local applications cache
+#[allow(dead_code)]
+pub fn invalidate_applications_cache() {
+    APPS_CACHE.with(|cache| {
         *cache.borrow_mut() = None;
     });
 }
@@ -110,44 +189,9 @@ impl Devices {
         Ok(Devices(res.into_iter()))
     }
 
+    /// Get available running applications (uses cache, ~1µs on cache hit)
     pub fn available_applications() -> Result<Vec<Retained<SCRunningApplication>>, DevicesError> {
-        let (tx, rx) = channel();
-
-        let handler = RcBlock::new(
-            move |content: *mut SCShareableContent, error: *mut NSError| {
-                if !error.is_null() {
-                    let err = unsafe { Retained::retain(error) };
-                    let _ = tx.send(Err(BackendSpecificError {
-                        description: format!("{:?}", err),
-                    }));
-                } else if !content.is_null() {
-                    let content = unsafe { Retained::retain(content) };
-                    let _ = tx.send(Ok(content));
-                } else {
-                    let _ = tx.send(Err(BackendSpecificError {
-                        description: "Unknown error: content and error are both null".to_string(),
-                    }));
-                }
-            },
-        );
-
-        unsafe {
-            SCShareableContent::getShareableContentWithCompletionHandler(&handler);
-        }
-
-        // Add timeout for stability
-        let content = match rx.recv_timeout(Duration::from_secs(10)) {
-            Ok(result) => result.map_err(|e| DevicesError::from(e))?,
-            Err(_) => {
-                return Err(BackendSpecificError {
-                    description: "Timeout waiting for SCShareableContent".to_string(),
-                }
-                .into())
-            }
-        };
-
-        let apps = unsafe { content.unwrap().applications() };
-        Ok(apps.iter().map(|a| a.to_owned()).collect())
+        get_applications_cached()
     }
 }
 
