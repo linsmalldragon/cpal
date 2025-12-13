@@ -18,7 +18,7 @@ use objc2_core_media::{CMSampleBuffer, CMTime};
 use objc2_foundation::{NSArray, NSError, NSObject, NSObjectProtocol};
 use objc2_screen_capture_kit::{
     SCContentFilter, SCDisplay, SCRunningApplication, SCStream, SCStreamConfiguration,
-    SCStreamOutput, SCStreamOutputType,
+    SCStreamOutput, SCStreamOutputType, SCWindow,
 };
 
 impl Capturer {
@@ -79,11 +79,14 @@ impl HostTrait for Host {
 
 #[derive(Clone)]
 pub struct Device {
-    display: Retained<SCDisplay>,
-    excluded_apps: Vec<Retained<SCRunningApplication>>,
+    display_id: u32,
+    excluded_apps_pids: Vec<i32>,
     /// App names to exclude (matched at stream build time)
     excluded_app_names: Vec<String>,
 }
+
+unsafe impl Send for Device {}
+unsafe impl Sync for Device {}
 
 impl DeviceTrait for Device {
     type SupportedInputConfigs = SupportedInputConfigs;
@@ -91,11 +94,11 @@ impl DeviceTrait for Device {
     type Stream = Stream;
 
     fn name(&self) -> Result<String, DeviceNameError> {
-        Ok(self.name_impl())
+        Ok(format!("Display {}", self.display_id))
     }
 
     fn description(&self) -> Result<DeviceDescription, DeviceNameError> {
-        let name = self.name_impl();
+        let name = format!("Display {}", self.display_id);
         Ok(DeviceDescriptionBuilder::new(name)
             .device_type(crate::device_description::DeviceType::ScreenCaptureKit)
             .interface_type(crate::device_description::InterfaceType::Unknown)
@@ -104,9 +107,10 @@ impl DeviceTrait for Device {
     }
 
     fn id(&self) -> Result<DeviceId, DeviceIdError> {
-        // SCDisplay usually has displayID property
-        let id = unsafe { self.display.displayID() };
-        Ok(DeviceId(HostId::ScreenCaptureKit, id.to_string()))
+        Ok(DeviceId(
+            HostId::ScreenCaptureKit,
+            self.display_id.to_string(),
+        ))
     }
 
     fn supported_input_configs(
@@ -169,16 +173,30 @@ impl DeviceTrait for Device {
 
 impl Device {
     pub fn new(display: Retained<SCDisplay>) -> Self {
+        let display_id = unsafe { display.displayID() };
         Self {
-            display,
-            excluded_apps: Vec::new(),
+            display_id,
+            excluded_apps_pids: Vec::new(),
             excluded_app_names: Vec::new(),
         }
     }
 
     /// Set excluded apps by SCRunningApplication references (advanced API)
     pub fn set_excluded_apps(&mut self, apps: &[Retained<SCRunningApplication>]) {
-        self.excluded_apps = apps.to_vec();
+        self.excluded_apps_pids = apps.iter().map(|a| unsafe { a.processID() }).collect();
+    }
+
+    /// Set excluded apps by name (simple API, recommended)
+    ///
+    /// App names are matched against running applications when building the stream.
+    /// Uses a cached list of running apps for performance.
+    ///
+    /// # Example
+    /// ```ignore
+    /// device.set_excluded_app_names(&["QQ音乐", "微信"]);
+    /// ```
+    pub fn set_excluded_apps_pids(&mut self, pids: &[i32]) {
+        self.excluded_apps_pids = pids.to_vec();
     }
 
     /// Set excluded apps by name (simple API, recommended)
@@ -197,11 +215,6 @@ impl Device {
     /// Get the list of excluded app names
     pub fn excluded_app_names(&self) -> &[String] {
         &self.excluded_app_names
-    }
-
-    fn name_impl(&self) -> String {
-        let id = unsafe { self.display.displayID() };
-        format!("Display {}", id)
     }
 
     fn supported_input_configs(
@@ -261,44 +274,53 @@ impl Device {
             cfg.setExcludesCurrentProcessAudio(false);
         }
 
-        let windows = NSArray::new();
+        // Resolve display object from ID
+        let display = enumerate::get_display_by_id(self.display_id).ok_or_else(|| {
+            BuildStreamError::BackendSpecific {
+                err: BackendSpecificError {
+                    description: format!("Display {} not found", self.display_id),
+                },
+            }
+        })?;
 
-        // Resolve excluded app names to SCRunningApplication objects
-        let all_excluded_apps: Vec<Retained<SCRunningApplication>> =
-            if !self.excluded_app_names.is_empty() {
-                // Get cached applications list
-                let apps = enumerate::get_applications_cached().unwrap_or_default();
+        let windows: Retained<NSArray<SCWindow>> = NSArray::new();
 
-                // Match app names
-                apps.into_iter()
-                    .filter(|app| {
-                        let app_name = unsafe { app.applicationName().to_string() };
-                        self.excluded_app_names
-                            .iter()
-                            .any(|name| app_name.contains(name.as_str()))
-                    })
-                    .collect()
-            } else {
-                self.excluded_apps.clone()
-            };
+        // Resolve excluded app names/PIDs to SCRunningApplication objects
+        let mut excluded_apps_refs: Vec<Retained<SCRunningApplication>> = Vec::new();
 
-        let filter: Retained<SCContentFilter> = if all_excluded_apps.is_empty() {
+        // 1. Resolve by names associated with this device config
+        if !self.excluded_app_names.is_empty() {
+            let matched_apps = enumerate::find_apps_by_name_substrings(&self.excluded_app_names);
+            excluded_apps_refs.extend(matched_apps);
+        }
+
+        // 2. Resolve by PIDs associated with this device config
+        if !self.excluded_apps_pids.is_empty() {
+            for pid in &self.excluded_apps_pids {
+                if let Some(app) = enumerate::get_running_application_by_pid(*pid) {
+                    excluded_apps_refs.push(app);
+                }
+            }
+        }
+
+        let filter: Retained<SCContentFilter> = if excluded_apps_refs.is_empty() {
             unsafe {
                 let ptr: *mut SCContentFilter = msg_send![class!(SCContentFilter), alloc];
                 let alloc: Allocated<SCContentFilter> = std::mem::transmute(ptr);
-                SCContentFilter::initWithDisplay_excludingWindows(alloc, &self.display, &windows)
+                SCContentFilter::initWithDisplay_excludingWindows(alloc, &display, &windows)
             }
         } else {
+            // Deduplicate if needed, or just let SCContentFilter handle it (it likely handles dupes fine)
             let apps_refs: Vec<&SCRunningApplication> =
-                all_excluded_apps.iter().map(|a| &**a).collect();
-            let excluded_apps = NSArray::from_slice(&apps_refs);
+                excluded_apps_refs.iter().map(|a| &**a).collect();
+            let excluded_apps_nsarray = NSArray::from_slice(&apps_refs);
             unsafe {
                 let ptr: *mut SCContentFilter = msg_send![class!(SCContentFilter), alloc];
                 let alloc: Allocated<SCContentFilter> = std::mem::transmute(ptr);
                 SCContentFilter::initWithDisplay_excludingApplications_exceptingWindows(
                     alloc,
-                    &self.display,
-                    &excluded_apps,
+                    &display,
+                    &excluded_apps_nsarray,
                     &windows,
                 )
             }
@@ -487,18 +509,8 @@ define_class!(
     }
 );
 
-// ...
-
-// ...
-
-// ... FFI ...
-
-// ...
-
 #[allow(unused)]
 fn frames_to_duration(frames: usize, rate: crate::SampleRate) -> std::time::Duration {
-    // rate is u32
-    // Trying to remove .0 again. If this fails I'll be very sad.
     let secsf = frames as f64 / (rate as f64);
     let secs = secsf as u64;
     let nanos = ((secsf - secs as f64) * 1_000_000_000.0) as u32;
@@ -559,11 +571,6 @@ impl CapturerInner {
             if status != 0 {
                 return;
             }
-
-            // ScreenCaptureKit defaults: F32, 2ch, 48kHz.
-            // We assume valid length for now.
-
-            // Assume aligned f32
             let float_ptr = data_ptr as *const f32;
             let floats_len = total_length / 4;
             let samples = std::slice::from_raw_parts(float_ptr, floats_len);

@@ -175,6 +175,41 @@ pub fn invalidate_applications_cache() {
     });
 }
 
+/// Helper to find a specific display by ID from the cache
+pub(crate) fn get_display_by_id(display_id: u32) -> Option<Retained<SCDisplay>> {
+    let displays = get_displays_cached().ok()?;
+    displays
+        .into_iter()
+        .find(|d| unsafe { d.displayID() } == display_id)
+}
+
+/// Helper to find a specific running application by PID from the cache
+pub(crate) fn get_running_application_by_pid(pid: i32) -> Option<Retained<SCRunningApplication>> {
+    let apps = get_applications_cached().ok()?;
+    apps.into_iter().find(|a| unsafe { a.processID() } == pid)
+}
+
+/// Helper to find applications whose names contain any of the given substrings
+pub(crate) fn find_apps_by_name_substrings(
+    substrings: &[String],
+) -> Vec<Retained<SCRunningApplication>> {
+    if substrings.is_empty() {
+        return Vec::new();
+    }
+    let Ok(apps) = get_applications_cached() else {
+        return Vec::new();
+    };
+
+    let mut result = Vec::new();
+    for app in apps {
+        let app_name = unsafe { app.applicationName().to_string() };
+        if substrings.iter().any(|sub| app_name.contains(sub.as_str())) {
+            result.push(app);
+        }
+    }
+    result
+}
+
 pub struct Devices(VecIntoIter<Device>);
 
 impl Devices {
