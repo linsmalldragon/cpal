@@ -42,6 +42,23 @@ fn main() -> Result<(), anyhow::Error> {
                 .map_or("Unknown ID".to_string(), |id| id.to_string());
             if let Ok(desc) = device.description() {
                 println!("  {}. {id} ({})", device_index + 1, desc);
+                println!(
+                    "    Desc: name={}; manufacturer={}; driver={}; type={}; interface={}; direction={}; address={}",
+                    desc.name(),
+                    desc.manufacturer().unwrap_or("Unknown"),
+                    desc.driver().unwrap_or("Unknown"),
+                    desc.device_type(),
+                    desc.interface_type(),
+                    desc.direction(),
+                    desc.address().unwrap_or("Unknown")
+                );
+                let extended = desc.extended();
+                if !extended.is_empty() {
+                    println!("    Desc extended:");
+                    for line in extended {
+                        println!("      {line}");
+                    }
+                }
             } else {
                 println!("  {}. {id}", device_index + 1);
             }

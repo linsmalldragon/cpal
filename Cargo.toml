@@ -14,10 +14,7 @@ rust-version = "1.70"
 # Provides low-latency audio I/O by bypassing the Windows audio stack
 # Requires: ASIO drivers and LLVM/Clang for build-time bindings
 # See README for detailed setup instructions
-asio = [
-    "dep:asio-sys",
-    "dep:num-traits",
-]
+asio = ["dep:asio-sys", "dep:num-traits"]
 
 # JACK Audio Connection Kit backend
 # Provides low-latency connections between applications and audio hardware
@@ -90,7 +87,7 @@ audio_thread_priority = { version = "0.34", optional = true }
 jack = { version = "0.13", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-cidre = { git = "https://github.com/yury/cidre.git", rev = "f05c428" }
+cidre = { version = "0.11.5" }
 
 
 [target.'cfg(target_os = "windows")'.dependencies.jack]

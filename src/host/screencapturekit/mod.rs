@@ -76,7 +76,7 @@ impl DeviceTrait for Device {
     fn id(&self) -> Result<DeviceId, DeviceIdError> {
         Ok(DeviceId(
             HostId::ScreenCaptureKit,
-            self.display.display_id().to_string(),
+            self.display.display_id().0.to_string(),
         ))
     }
 
@@ -144,7 +144,7 @@ impl Device {
     }
 
     fn name(&self) -> String {
-        format!("Display {}", self.display.display_id())
+        format!("Display {}", self.display.display_id().0)
     }
 
     fn supported_input_configs(
