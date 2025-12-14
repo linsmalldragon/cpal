@@ -483,6 +483,36 @@ impl Stream {
         self.update_content_filter_internal(display_id, &excluded_apps_refs)
     }
 
+    /// Update excluded applications by bundle identifiers during streaming (without interrupting capture)
+    ///
+    /// This dynamically updates the content filter to exclude apps with the given bundle IDs.
+    /// The audio stream continues without interruption.
+    ///
+    /// Bundle IDs are like "com.tencent.QQMusicMac", "com.apple.Safari", etc.
+    /// You can find an app's bundle ID using: `mdls -name kMDItemCFBundleIdentifier /Applications/AppName.app`
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Exclude QQ Music by bundle ID
+    /// stream.update_excluded_apps_by_bundle_ids(&["com.tencent.QQMusicMac"])?;
+    ///
+    /// // Clear all exclusions
+    /// stream.update_excluded_apps_by_bundle_ids(&[])?;
+    /// ```
+    pub fn update_excluded_apps_by_bundle_ids(
+        &self,
+        bundle_ids: &[&str],
+    ) -> Result<(), UpdateFilterError> {
+        let stream = self.inner.borrow();
+        let display_id = stream.display_id;
+
+        // Resolve excluded apps from bundle IDs
+        let bundle_ids_vec: Vec<String> = bundle_ids.iter().map(|s| s.to_string()).collect();
+        let excluded_apps_refs = enumerate::find_apps_by_bundle_ids(&bundle_ids_vec);
+
+        self.update_content_filter_internal(display_id, &excluded_apps_refs)
+    }
+
     /// Internal method to update the content filter
     fn update_content_filter_internal(
         &self,

@@ -83,13 +83,15 @@ fn run_macos_example() -> Result<(), anyhow::Error> {
     println!("🔊 You should see audio from ALL applications\n");
     std::thread::sleep(Duration::from_secs(5));
 
-    // Phase 2: Exclude QQ音乐 dynamically
-    println!("\n=== Phase 2: Excluding QQ音乐 (5 seconds) ===");
+    // Phase 2: Exclude QQ音乐 dynamically using bundle ID (recommended)
+    // Bundle ID is more reliable than app name as it doesn't change with locale
+    // Find bundle ID: mdls -name kMDItemCFBundleIdentifier /Applications/QQMusic.app
+    println!("\n=== Phase 2: Excluding QQ音乐 by Bundle ID (5 seconds) ===");
     let t0 = Instant::now();
-    match stream.update_excluded_apps_by_names(&["QQ音乐"]) {
+    match stream.update_excluded_apps_by_bundle_ids(&["com.tencent.QQMusicMac"]) {
         Ok(()) => {
             println!(
-                "✅ Filter updated in {:?} - QQ音乐 is now EXCLUDED",
+                "✅ Filter updated in {:?} - QQ音乐 is now EXCLUDED (via bundle ID)",
                 t0.elapsed()
             );
             println!("🔇 You should NOT see audio from QQ音乐\n");
@@ -103,7 +105,7 @@ fn run_macos_example() -> Result<(), anyhow::Error> {
     // Phase 3: Clear exclusions (re-include all apps)
     println!("\n=== Phase 3: Clearing exclusions (5 seconds) ===");
     let t1 = Instant::now();
-    match stream.update_excluded_apps_by_names(&[]) {
+    match stream.update_excluded_apps_by_bundle_ids(&[]) {
         Ok(()) => {
             println!(
                 "✅ Filter updated in {:?} - All apps are now INCLUDED",
@@ -117,28 +119,28 @@ fn run_macos_example() -> Result<(), anyhow::Error> {
     }
     std::thread::sleep(Duration::from_secs(5));
 
-    // Phase 4: Exclude by PID (demonstrating refresh_applications_cache)
-    println!("\n=== Phase 4: Demonstrate PID-based exclusion ===");
+    // Phase 4: Exclude by bundle ID (demonstrating refresh_applications_cache)
+    println!("\n=== Phase 4: Demonstrate bundle ID-based exclusion ===");
 
     // To refresh the app cache, we need to access the underlying ScreenCaptureKitStream
-    // This is only needed if you want to detect newly launched applications
+    // This is useful if you want to detect newly launched applications
     use cpal::platform::ScreenCaptureKitStream;
     match ScreenCaptureKitStream::refresh_applications_cache() {
         Ok(apps) => {
             println!("Found {} running applications:", apps.len());
 
-            // Find QQ音乐 and get its PID
+            // Find QQ音乐 and get its bundle ID
             for app in &apps {
                 let name = unsafe { app.applicationName().to_string() };
-                let pid = unsafe { app.processID() };
-                if name.contains("QQ") || name.contains("音乐") {
-                    println!("  🎵 {} (PID: {})", name, pid);
+                let bundle_id = unsafe { app.bundleIdentifier().to_string() };
+                if name.contains("QQ") || name.contains("音乐") || bundle_id.contains("QQMusic") {
+                    println!("  🎵 {} (Bundle ID: {})", name, bundle_id);
 
-                    // Exclude by PID using the generic Stream API
+                    // Exclude by bundle ID using the generic Stream API
                     let t2 = Instant::now();
-                    match stream.update_excluded_apps_by_pids(&[pid]) {
+                    match stream.update_excluded_apps_by_bundle_ids(&[&bundle_id]) {
                         Ok(()) => {
-                            println!("  ✅ Excluded by PID in {:?}", t2.elapsed());
+                            println!("  ✅ Excluded by bundle ID in {:?}", t2.elapsed());
                         }
                         Err(e) => {
                             println!("  ❌ Failed: {:?}", e);
@@ -153,7 +155,7 @@ fn run_macos_example() -> Result<(), anyhow::Error> {
         }
     }
 
-    println!("\n🔇 If QQ音乐 was found, it's now excluded by PID");
+    println!("\n🔇 If QQ音乐 was found, it's now excluded by bundle ID");
     std::thread::sleep(Duration::from_secs(3));
 
     println!("\n=== Demo Complete! ===");

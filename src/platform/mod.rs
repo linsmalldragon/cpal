@@ -814,6 +814,34 @@ mod platform_impl {
             }
         }
 
+        /// Update excluded applications by bundle identifiers during streaming (without interrupting capture)
+        ///
+        /// This dynamically updates the content filter to exclude apps with the given bundle IDs.
+        /// The audio stream continues without interruption.
+        ///
+        /// Bundle IDs are like "com.tencent.QQMusicMac", "com.apple.Safari", etc.
+        /// You can find an app's bundle ID using: `mdls -name kMDItemCFBundleIdentifier /Applications/AppName.app`
+        ///
+        /// **Note**: This method only works for ScreenCaptureKit streams. For other stream types,
+        /// it returns an error.
+        ///
+        /// # Example
+        /// ```ignore
+        /// // Exclude QQ Music by bundle ID
+        /// stream.update_excluded_apps_by_bundle_ids(&["com.tencent.QQMusicMac"])?;
+        ///
+        /// // Clear all exclusions
+        /// stream.update_excluded_apps_by_bundle_ids(&[])?;
+        /// ```
+        pub fn update_excluded_apps_by_bundle_ids(&self, bundle_ids: &[&str]) -> Result<(), UpdateFilterError> {
+            match &self.0 {
+                StreamInner::ScreenCaptureKit(s) => s.update_excluded_apps_by_bundle_ids(bundle_ids),
+                _ => Err(UpdateFilterError {
+                    description: "update_excluded_apps_by_bundle_ids is only supported for ScreenCaptureKit streams".to_string(),
+                }),
+            }
+        }
+
         /// Check if this stream is a ScreenCaptureKit stream
         ///
         /// Returns `true` if this stream was created from a ScreenCaptureKit device.

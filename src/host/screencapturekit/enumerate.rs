@@ -210,6 +210,29 @@ pub(crate) fn find_apps_by_name_substrings(
     result
 }
 
+/// Helper to find applications by their bundle identifiers (exact match)
+///
+/// Bundle IDs are like "com.tencent.QQMusicMac", "com.apple.Safari", etc.
+pub(crate) fn find_apps_by_bundle_ids(
+    bundle_ids: &[String],
+) -> Vec<Retained<SCRunningApplication>> {
+    if bundle_ids.is_empty() {
+        return Vec::new();
+    }
+    let Ok(apps) = get_applications_cached() else {
+        return Vec::new();
+    };
+
+    let mut result = Vec::new();
+    for app in apps {
+        let app_bundle_id = unsafe { app.bundleIdentifier().to_string() };
+        if bundle_ids.iter().any(|bid| bid == &app_bundle_id) {
+            result.push(app);
+        }
+    }
+    result
+}
+
 pub struct Devices(VecIntoIter<Device>);
 
 impl Devices {
