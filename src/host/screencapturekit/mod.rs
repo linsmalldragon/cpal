@@ -21,6 +21,20 @@ use objc2_screen_capture_kit::{
     SCStreamOutput, SCStreamOutputType, SCWindow,
 };
 
+/// Error type for updating content filter during streaming
+#[derive(Debug, Clone)]
+pub struct UpdateFilterError {
+    pub description: String,
+}
+
+impl std::fmt::Display for UpdateFilterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "UpdateFilterError: {}", self.description)
+    }
+}
+
+impl std::error::Error for UpdateFilterError {}
+
 impl Capturer {
     pub fn new(inner: CapturerInner) -> Retained<Self> {
         unsafe {
@@ -376,6 +390,7 @@ impl Device {
             _capturer: capturer,
             sc_stream,
             playing: false,
+            display_id: self.display_id,
         }))
     }
 
@@ -400,6 +415,8 @@ struct StreamInner {
     _capturer: Retained<Capturer>,
     sc_stream: Retained<SCStream>,
     playing: bool,
+    // Store display_id for dynamic filter updates
+    display_id: u32,
 }
 
 #[derive(Clone)]
@@ -412,6 +429,139 @@ impl Stream {
         Self {
             inner: Rc::new(RefCell::new(inner)),
         }
+    }
+
+    /// Update excluded applications by PIDs during streaming (without interrupting capture)
+    ///
+    /// This dynamically updates the content filter to exclude apps with the given PIDs.
+    /// The audio stream continues without interruption.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Exclude QQ Music (assume PID is 12345)
+    /// stream.update_excluded_apps_by_pids(&[12345])?;
+    ///
+    /// // Clear all exclusions
+    /// stream.update_excluded_apps_by_pids(&[])?;
+    /// ```
+    pub fn update_excluded_apps_by_pids(&self, pids: &[i32]) -> Result<(), UpdateFilterError> {
+        let stream = self.inner.borrow();
+        let display_id = stream.display_id;
+
+        // Resolve excluded apps from PIDs
+        let mut excluded_apps_refs: Vec<Retained<SCRunningApplication>> = Vec::new();
+        for pid in pids {
+            if let Some(app) = enumerate::get_running_application_by_pid(*pid) {
+                excluded_apps_refs.push(app);
+            }
+        }
+
+        self.update_content_filter_internal(display_id, &excluded_apps_refs)
+    }
+
+    /// Update excluded applications by name substrings during streaming (without interrupting capture)
+    ///
+    /// This dynamically updates the content filter to exclude apps whose names contain
+    /// any of the given substrings. The audio stream continues without interruption.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Exclude QQ Music and WeChat
+    /// stream.update_excluded_apps_by_names(&["QQ音乐", "微信"])?;
+    ///
+    /// // Clear all exclusions
+    /// stream.update_excluded_apps_by_names(&[])?;
+    /// ```
+    pub fn update_excluded_apps_by_names(&self, names: &[&str]) -> Result<(), UpdateFilterError> {
+        let stream = self.inner.borrow();
+        let display_id = stream.display_id;
+
+        // Resolve excluded apps from names
+        let names_vec: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+        let excluded_apps_refs = enumerate::find_apps_by_name_substrings(&names_vec);
+
+        self.update_content_filter_internal(display_id, &excluded_apps_refs)
+    }
+
+    /// Internal method to update the content filter
+    fn update_content_filter_internal(
+        &self,
+        display_id: u32,
+        excluded_apps: &[Retained<SCRunningApplication>],
+    ) -> Result<(), UpdateFilterError> {
+        // Get the display
+        let display =
+            enumerate::get_display_by_id(display_id).ok_or_else(|| UpdateFilterError {
+                description: format!("Display {} not found", display_id),
+            })?;
+
+        let windows: Retained<NSArray<SCWindow>> = NSArray::new();
+
+        // Build new content filter
+        let filter: Retained<SCContentFilter> = if excluded_apps.is_empty() {
+            unsafe {
+                let ptr: *mut SCContentFilter = msg_send![class!(SCContentFilter), alloc];
+                let alloc: Allocated<SCContentFilter> = std::mem::transmute(ptr);
+                SCContentFilter::initWithDisplay_excludingWindows(alloc, &display, &windows)
+            }
+        } else {
+            let apps_refs: Vec<&SCRunningApplication> =
+                excluded_apps.iter().map(|a| &**a).collect();
+            let excluded_apps_nsarray = NSArray::from_slice(&apps_refs);
+            unsafe {
+                let ptr: *mut SCContentFilter = msg_send![class!(SCContentFilter), alloc];
+                let alloc: Allocated<SCContentFilter> = std::mem::transmute(ptr);
+                SCContentFilter::initWithDisplay_excludingApplications_exceptingWindows(
+                    alloc,
+                    &display,
+                    &excluded_apps_nsarray,
+                    &windows,
+                )
+            }
+        };
+
+        // Update the stream's content filter
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        let handler = RcBlock::new(move |error: *mut NSError| {
+            if !error.is_null() {
+                let err = unsafe { Retained::retain(error) };
+                let _ = tx.send(Err(UpdateFilterError {
+                    description: format!("{:?}", err),
+                }));
+            } else {
+                let _ = tx.send(Ok(()));
+            }
+        });
+
+        let stream = self.inner.borrow();
+        unsafe {
+            stream
+                .sc_stream
+                .updateContentFilter_completionHandler(&filter, Some(&handler));
+        }
+
+        // Wait for completion with timeout
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(result) => result,
+            Err(_) => Err(UpdateFilterError {
+                description: "Timeout waiting for updateContentFilter".to_string(),
+            }),
+        }
+    }
+
+    /// Refresh the applications cache and return the new list
+    ///
+    /// Call this if you need to detect newly launched applications.
+    /// The returned list can be used to find PIDs for `update_excluded_apps_by_pids`.
+    pub fn refresh_applications_cache(
+    ) -> Result<Vec<Retained<SCRunningApplication>>, UpdateFilterError> {
+        enumerate::refresh_applications_cache().map_err(|e| UpdateFilterError {
+            description: format!("{:?}", e),
+        })?;
+        enumerate::get_applications_cached().map_err(|e| UpdateFilterError {
+            description: format!("{:?}", e),
+        })
     }
 }
 
