@@ -6,6 +6,10 @@
 //! 3. Re-include the app by clearing exclusions
 //!
 //! All without interrupting the audio stream!
+//!
+//! **Note**: This example uses the generic `cpal::Stream` type, which works with
+//! any backend. The dynamic update methods are only available for ScreenCaptureKit
+//! streams on macOS, but the API is the same regardless of the backend.
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::HostId;
@@ -26,8 +30,6 @@ fn main() -> Result<(), anyhow::Error> {
 
 #[cfg(target_os = "macos")]
 fn run_macos_example() -> Result<(), anyhow::Error> {
-    use cpal::platform::{ScreenCaptureKitDevice, ScreenCaptureKitStream};
-
     println!("=== Dynamic Excluded Apps Update Demo ===\n");
 
     // 1. Get ScreenCaptureKit Host
@@ -39,20 +41,15 @@ fn run_macos_example() -> Result<(), anyhow::Error> {
         .default_input_device()
         .expect("No input device available");
 
-    let sck_device: ScreenCaptureKitDevice = match device.into_inner() {
-        cpal::platform::DeviceInner::ScreenCaptureKit(d) => d,
-        _ => panic!("Expected ScreenCaptureKit device"),
-    };
-
-    println!("Device: {}", sck_device.description()?.name());
+    println!("Device: {}", device.description()?.name());
 
     // 3. Build stream with NO exclusions initially
-    // Note: build_input_stream_raw on ScreenCaptureKitDevice returns ScreenCaptureKitStream directly
-    let supported_config = sck_device.default_input_config()?;
+    // Using generic cpal::Stream (works with any backend)
+    let supported_config = device.default_input_config()?;
     let sample_format = supported_config.sample_format();
     let config: cpal::StreamConfig = supported_config.into();
 
-    let stream: ScreenCaptureKitStream = sck_device.build_input_stream_raw(
+    let stream = device.build_input_stream_raw(
         &config,
         sample_format,
         move |data: &cpal::Data, _: &cpal::InputCallbackInfo| {
@@ -72,6 +69,14 @@ fn run_macos_example() -> Result<(), anyhow::Error> {
 
     stream.play()?;
     println!("Stream started!\n");
+
+    // Optional: Check if this is a ScreenCaptureKit stream
+    // (The update methods will return an error for other stream types)
+    if stream.is_screencapturekit() {
+        println!("✅ This is a ScreenCaptureKit stream - dynamic updates are supported\n");
+    } else {
+        println!("⚠️  This is not a ScreenCaptureKit stream - dynamic updates may not work\n");
+    }
 
     // Phase 1: Capture all audio (5 seconds)
     println!("=== Phase 1: Capturing ALL audio (5 seconds) ===");
@@ -115,7 +120,9 @@ fn run_macos_example() -> Result<(), anyhow::Error> {
     // Phase 4: Exclude by PID (demonstrating refresh_applications_cache)
     println!("\n=== Phase 4: Demonstrate PID-based exclusion ===");
 
-    // Refresh the app cache to get latest running apps
+    // To refresh the app cache, we need to access the underlying ScreenCaptureKitStream
+    // This is only needed if you want to detect newly launched applications
+    use cpal::platform::ScreenCaptureKitStream;
     match ScreenCaptureKitStream::refresh_applications_cache() {
         Ok(apps) => {
             println!("Found {} running applications:", apps.len());
@@ -127,7 +134,7 @@ fn run_macos_example() -> Result<(), anyhow::Error> {
                 if name.contains("QQ") || name.contains("音乐") {
                     println!("  🎵 {} (PID: {})", name, pid);
 
-                    // Exclude by PID
+                    // Exclude by PID using the generic Stream API
                     let t2 = Instant::now();
                     match stream.update_excluded_apps_by_pids(&[pid]) {
                         Ok(()) => {

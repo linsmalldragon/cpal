@@ -745,6 +745,7 @@ mod platform_impl {
         Host as ScreenCaptureKitHost, Stream as ScreenCaptureKitStream,
         SupportedInputConfigs as ScreenCaptureKitSupportedInputConfigs,
         SupportedOutputConfigs as ScreenCaptureKitSupportedOutputConfigs,
+        UpdateFilterError,
     };
     impl_platform_host!(
         CoreAudio => CoreAudioHost,
@@ -758,6 +759,67 @@ mod platform_impl {
         CoreAudioHost::new()
             .expect("the default host should always be available")
             .into()
+    }
+
+    // ScreenCaptureKit-specific Stream extensions for macOS
+    #[cfg(target_os = "macos")]
+    impl Stream {
+        /// Update excluded applications by name substrings during streaming (without interrupting capture)
+        ///
+        /// This dynamically updates the content filter to exclude apps whose names contain
+        /// any of the given substrings. The audio stream continues without interruption.
+        ///
+        /// **Note**: This method only works for ScreenCaptureKit streams. For other stream types,
+        /// it returns an error.
+        ///
+        /// # Example
+        /// ```ignore
+        /// // Exclude QQ Music and WeChat
+        /// stream.update_excluded_apps_by_names(&["QQ音乐", "微信"])?;
+        ///
+        /// // Clear all exclusions
+        /// stream.update_excluded_apps_by_names(&[])?;
+        /// ```
+        pub fn update_excluded_apps_by_names(&self, names: &[&str]) -> Result<(), UpdateFilterError> {
+            match &self.0 {
+                StreamInner::ScreenCaptureKit(s) => s.update_excluded_apps_by_names(names),
+                _ => Err(UpdateFilterError {
+                    description: "update_excluded_apps_by_names is only supported for ScreenCaptureKit streams".to_string(),
+                }),
+            }
+        }
+
+        /// Update excluded applications by PIDs during streaming (without interrupting capture)
+        ///
+        /// This dynamically updates the content filter to exclude apps with the given PIDs.
+        /// The audio stream continues without interruption.
+        ///
+        /// **Note**: This method only works for ScreenCaptureKit streams. For other stream types,
+        /// it returns an error.
+        ///
+        /// # Example
+        /// ```ignore
+        /// // Exclude app with PID 12345
+        /// stream.update_excluded_apps_by_pids(&[12345])?;
+        ///
+        /// // Clear all exclusions
+        /// stream.update_excluded_apps_by_pids(&[])?;
+        /// ```
+        pub fn update_excluded_apps_by_pids(&self, pids: &[i32]) -> Result<(), UpdateFilterError> {
+            match &self.0 {
+                StreamInner::ScreenCaptureKit(s) => s.update_excluded_apps_by_pids(pids),
+                _ => Err(UpdateFilterError {
+                    description: "update_excluded_apps_by_pids is only supported for ScreenCaptureKit streams".to_string(),
+                }),
+            }
+        }
+
+        /// Check if this stream is a ScreenCaptureKit stream
+        ///
+        /// Returns `true` if this stream was created from a ScreenCaptureKit device.
+        pub fn is_screencapturekit(&self) -> bool {
+            matches!(&self.0, StreamInner::ScreenCaptureKit(_))
+        }
     }
 }
 

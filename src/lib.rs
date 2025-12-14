@@ -187,6 +187,10 @@ pub use platform::{
     available_hosts, default_host, host_from_id, Device, Devices, Host, HostId, Stream,
     SupportedInputConfigs, SupportedOutputConfigs, ALL_HOSTS,
 };
+
+// Re-export ScreenCaptureKit-specific types on macOS
+#[cfg(target_os = "macos")]
+pub use platform::UpdateFilterError;
 pub use samples_formats::{FromSample, Sample, SampleFormat, SizedSample, I24, U24};
 use std::convert::TryInto;
 use std::time::Duration;
