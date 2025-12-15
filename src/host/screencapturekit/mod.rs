@@ -601,10 +601,26 @@ impl StreamTrait for Stream {
             let handler = RcBlock::new(move |error: *mut NSError| {
                 if !error.is_null() {
                     let err = unsafe { Retained::retain(error) };
-                    tx.send(Err(BackendSpecificError {
-                        description: format!("{:?}", err),
-                    }))
-                    .unwrap();
+                    if let Some(err) = err {
+                        // Error code -3808 means stream is already stopped
+                        // This can happen if ScreenCaptureKit stopped the stream internally
+                        let error_code = err.code();
+                        tx.send(Err((
+                            error_code,
+                            BackendSpecificError {
+                                description: format!("{:?}", err),
+                            },
+                        )))
+                        .unwrap();
+                    } else {
+                        tx.send(Err((
+                            0,
+                            BackendSpecificError {
+                                description: "Unknown error (null NSError)".to_string(),
+                            },
+                        )))
+                        .unwrap();
+                    }
                 } else {
                     tx.send(Ok(())).unwrap();
                 }
@@ -616,7 +632,17 @@ impl StreamTrait for Stream {
                     .stopCaptureWithCompletionHandler(Some(&handler));
             }
 
-            rx.recv().unwrap()?;
+            match rx.recv().unwrap() {
+                Ok(()) => {}
+                Err((error_code, err)) => {
+                    // Error code -3808: stream is already stopped or doesn't exist
+                    // This is not a fatal error, just means the stream was already stopped
+                    if error_code != -3808 {
+                        return Err(err.into());
+                    }
+                    // Stream was already stopped, that's fine
+                }
+            }
             stream.playing = false;
         }
         Ok(())
