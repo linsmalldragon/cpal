@@ -761,6 +761,97 @@ mod platform_impl {
             .into()
     }
 
+    // Host extensions for macOS
+    #[cfg(target_os = "macos")]
+    impl Host {
+        /// Returns a default input device, but deprioritizes Bluetooth devices that have both
+        /// microphone and speaker capabilities (duplex devices like AirPods Pro).
+        ///
+        /// This is useful for avoiding Bluetooth headsets as microphone input, as they typically
+        /// have poor audio quality when used for recording due to bandwidth limitations of
+        /// Bluetooth audio profiles (switching to HFP/HSP for microphone input).
+        ///
+        /// The priority order is:
+        /// 1. Non-Bluetooth input devices (built-in mic, USB microphones, etc.)
+        /// 2. Bluetooth devices that are input-only (dedicated Bluetooth microphones)
+        /// 3. Bluetooth duplex devices (AirPods Pro, Bluetooth headsets with mic+speaker)
+        ///
+        /// Returns `None` if no input device is available.
+        ///
+        /// # Example
+        ///
+        /// ```no_run
+        /// use cpal::traits::HostTrait;
+        ///
+        /// let host = cpal::default_host();
+        /// // Prefer non-Bluetooth mic, fall back to AirPods only if no other option
+        /// let device = host.default_input_device_bluetooth_mic_speaker_last();
+        /// ```
+        pub fn default_input_device_bluetooth_mic_speaker_last(&self) -> Option<Device> {
+            use crate::traits::{DeviceTrait, HostTrait};
+            use crate::{DeviceDirection, InterfaceType};
+
+            // Get all input devices
+            let input_devices: Vec<Device> = match self.input_devices() {
+                Ok(devices) => devices.collect(),
+                Err(_) => return None,
+            };
+
+            if input_devices.is_empty() {
+                return None;
+            }
+
+            // On macOS, Bluetooth headsets (like AirPods) appear as separate input and output
+            // devices with the same name. We need to check if a Bluetooth input device has
+            // a corresponding output device with the same name.
+            let output_device_names: std::collections::HashSet<String> = self
+                .output_devices()
+                .ok()
+                .map(|devices| {
+                    devices
+                        .filter_map(|d| d.description().ok().map(|desc| desc.name().to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            // Helper function to check if a device is a Bluetooth headset with both mic and speaker
+            let is_bluetooth_mic_speaker = |device: &Device| -> bool {
+                if let Ok(desc) = device.description() {
+                    let is_bluetooth = desc.interface_type() == InterfaceType::Bluetooth;
+                    if !is_bluetooth {
+                        return false;
+                    }
+
+                    // Check if this is a duplex device directly
+                    if desc.direction() == DeviceDirection::Duplex {
+                        return true;
+                    }
+
+                    // On macOS, check if there's a corresponding output device with the same name
+                    // This indicates it's a Bluetooth headset with both mic and speaker
+                    let device_name = desc.name();
+                    output_device_names.contains(device_name)
+                } else {
+                    false
+                }
+            };
+
+            // Partition devices: non-Bluetooth-mic-speaker first, Bluetooth-mic-speaker last
+            let (preferred, bluetooth_mic_speaker): (Vec<_>, Vec<_>) =
+                input_devices.into_iter().partition(|device| {
+                    !is_bluetooth_mic_speaker(device)
+                });
+
+            // Prefer non-Bluetooth-mic-speaker devices
+            if let Some(device) = preferred.into_iter().next() {
+                return Some(device);
+            }
+
+            // Fall back to Bluetooth mic+speaker device if no other option
+            bluetooth_mic_speaker.into_iter().next()
+        }
+    }
+
     // ScreenCaptureKit-specific Stream extensions for macOS
     #[cfg(target_os = "macos")]
     impl Stream {

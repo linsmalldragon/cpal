@@ -22,9 +22,20 @@ use objc2_core_audio::{
     kAudioAggregateDeviceClassID, kAudioDevicePropertyAvailableNominalSampleRates,
     kAudioDevicePropertyBufferFrameSize, kAudioDevicePropertyBufferFrameSizeRange,
     kAudioDevicePropertyNominalSampleRate, kAudioDevicePropertyStreamConfiguration,
-    kAudioDevicePropertyStreamFormat, kAudioObjectPropertyClass, kAudioObjectPropertyElementMaster,
-    kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyScopeInput,
-    kAudioObjectPropertyScopeOutput, AudioClassID, AudioDeviceID, AudioObjectGetPropertyData,
+    kAudioDevicePropertyStreamFormat, kAudioDevicePropertyStreams,
+    kAudioDevicePropertyTransportType, kAudioDeviceTransportTypeAggregate,
+    kAudioDeviceTransportTypeBluetooth, kAudioDeviceTransportTypeBluetoothLE,
+    kAudioDeviceTransportTypeBuiltIn, kAudioDeviceTransportTypeDisplayPort,
+    kAudioDeviceTransportTypeFireWire, kAudioDeviceTransportTypeHDMI,
+    kAudioDeviceTransportTypePCI, kAudioDeviceTransportTypeThunderbolt,
+    kAudioDeviceTransportTypeUSB, kAudioDeviceTransportTypeVirtual,
+    kAudioObjectPropertyClass, kAudioObjectPropertyElementMaster, kAudioObjectPropertyScopeGlobal,
+    kAudioObjectPropertyScopeInput, kAudioObjectPropertyScopeOutput,
+    kAudioStreamPropertyTerminalType, kAudioStreamTerminalTypeHeadphones,
+    kAudioStreamTerminalTypeHeadsetMicrophone, kAudioStreamTerminalTypeLFESpeaker,
+    kAudioStreamTerminalTypeLine, kAudioStreamTerminalTypeMicrophone,
+    kAudioStreamTerminalTypeReceiverMicrophone, kAudioStreamTerminalTypeReceiverSpeaker,
+    kAudioStreamTerminalTypeSpeaker, AudioClassID, AudioDeviceID, AudioObjectGetPropertyData,
     AudioObjectGetPropertyDataSize, AudioObjectID, AudioObjectPropertyAddress,
     AudioObjectPropertyScope, AudioObjectSetPropertyData,
 };
@@ -388,6 +399,188 @@ impl Device {
         status == 0 && class_id == kAudioAggregateDeviceClassID
     }
 
+    /// Gets the transport type of the device (USB, Bluetooth, Built-in, etc.)
+    fn get_transport_type(&self) -> Option<crate::InterfaceType> {
+        let property_address = AudioObjectPropertyAddress {
+            mSelector: kAudioDevicePropertyTransportType,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain,
+        };
+
+        let mut transport_type: u32 = 0;
+        let data_size = size_of::<u32>() as u32;
+
+        let status = unsafe {
+            AudioObjectGetPropertyData(
+                self.audio_device_id,
+                NonNull::from(&property_address),
+                0,
+                null(),
+                NonNull::from(&data_size),
+                NonNull::from(&mut transport_type).cast(),
+            )
+        };
+
+        if status != 0 {
+            return None;
+        }
+
+        // Map CoreAudio transport types to cpal InterfaceType
+        Some(match transport_type {
+            t if t == kAudioDeviceTransportTypeBuiltIn => crate::InterfaceType::BuiltIn,
+            t if t == kAudioDeviceTransportTypeUSB => crate::InterfaceType::Usb,
+            t if t == kAudioDeviceTransportTypeBluetooth => crate::InterfaceType::Bluetooth,
+            t if t == kAudioDeviceTransportTypeBluetoothLE => crate::InterfaceType::Bluetooth,
+            t if t == kAudioDeviceTransportTypePCI => crate::InterfaceType::Pci,
+            t if t == kAudioDeviceTransportTypeFireWire => crate::InterfaceType::FireWire,
+            t if t == kAudioDeviceTransportTypeThunderbolt => crate::InterfaceType::Thunderbolt,
+            t if t == kAudioDeviceTransportTypeHDMI => crate::InterfaceType::Hdmi,
+            t if t == kAudioDeviceTransportTypeDisplayPort => crate::InterfaceType::DisplayPort,
+            t if t == kAudioDeviceTransportTypeAggregate => crate::InterfaceType::Aggregate,
+            t if t == kAudioDeviceTransportTypeVirtual => crate::InterfaceType::Virtual,
+            _ => crate::InterfaceType::Unknown,
+        })
+    }
+
+    /// Gets the device type (Speaker, Microphone, Headphones, Headset, etc.)
+    /// by querying the terminal type of the device's streams.
+    fn get_device_type(&self, scope: AudioObjectPropertyScope) -> Option<crate::DeviceType> {
+        // First, get the list of streams for this device
+        let property_address = AudioObjectPropertyAddress {
+            mSelector: kAudioDevicePropertyStreams,
+            mScope: scope,
+            mElement: kAudioObjectPropertyElementMain,
+        };
+
+        // Get the size of the streams array
+        let mut data_size: u32 = 0;
+        let status = unsafe {
+            AudioObjectGetPropertyDataSize(
+                self.audio_device_id,
+                NonNull::from(&property_address),
+                0,
+                null(),
+                NonNull::from(&mut data_size),
+            )
+        };
+
+        if status != 0 || data_size == 0 {
+            return None;
+        }
+
+        // Get the stream IDs
+        let num_streams = data_size as usize / size_of::<AudioObjectID>();
+        if num_streams == 0 {
+            return None;
+        }
+
+        let mut stream_ids: Vec<AudioObjectID> = vec![0; num_streams];
+        let status = unsafe {
+            AudioObjectGetPropertyData(
+                self.audio_device_id,
+                NonNull::from(&property_address),
+                0,
+                null(),
+                NonNull::from(&mut data_size),
+                NonNull::new_unchecked(stream_ids.as_mut_ptr().cast()),
+            )
+        };
+
+        if status != 0 {
+            return None;
+        }
+
+        // Get the terminal type of the first stream
+        if let Some(&stream_id) = stream_ids.first() {
+            let terminal_property = AudioObjectPropertyAddress {
+                mSelector: kAudioStreamPropertyTerminalType,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain,
+            };
+
+            let mut terminal_type: u32 = 0;
+            let mut terminal_size = size_of::<u32>() as u32;
+
+            let status = unsafe {
+                AudioObjectGetPropertyData(
+                    stream_id,
+                    NonNull::from(&terminal_property),
+                    0,
+                    null(),
+                    NonNull::from(&mut terminal_size),
+                    NonNull::from(&mut terminal_type).cast(),
+                )
+            };
+
+            if status == 0 {
+                // Map CoreAudio terminal types to cpal DeviceType
+                // CoreAudio uses two formats for terminal types:
+                // 1. FourCC format (e.g., 'micr', 'spkr') - defined in AudioHardware.h
+                // 2. USB Audio Terminal Types (e.g., 0x0201 = Microphone, 0x0301 = Speaker)
+                //
+                // USB Audio Terminal Types (from USB Audio Device Class Definition):
+                // Input Terminal Types:
+                //   0x0200 - Input Undefined
+                //   0x0201 - Microphone
+                //   0x0202 - Desktop Microphone
+                //   0x0203 - Personal Microphone
+                //   0x0204 - Omni-directional Microphone
+                //   0x0205 - Microphone Array
+                //   0x0206 - Processing Microphone Array
+                // Output Terminal Types:
+                //   0x0300 - Output Undefined
+                //   0x0301 - Speaker
+                //   0x0302 - Headphones
+                //   0x0303 - Head Mounted Display Audio
+                //   0x0304 - Desktop Speaker
+                //   0x0305 - Room Speaker
+                //   0x0306 - Communication Speaker
+                //   0x0307 - Low Frequency Effects Speaker
+                const USB_TERMINAL_MICROPHONE: u32 = 0x0201;
+                const USB_TERMINAL_DESKTOP_MIC: u32 = 0x0202;
+                const USB_TERMINAL_PERSONAL_MIC: u32 = 0x0203;
+                const USB_TERMINAL_OMNI_MIC: u32 = 0x0204;
+                const USB_TERMINAL_MIC_ARRAY: u32 = 0x0205;
+                const USB_TERMINAL_PROC_MIC_ARRAY: u32 = 0x0206;
+                const USB_TERMINAL_SPEAKER: u32 = 0x0301;
+                const USB_TERMINAL_HEADPHONES: u32 = 0x0302;
+                const USB_TERMINAL_HMD_AUDIO: u32 = 0x0303;
+                const USB_TERMINAL_DESKTOP_SPEAKER: u32 = 0x0304;
+                const USB_TERMINAL_ROOM_SPEAKER: u32 = 0x0305;
+                const USB_TERMINAL_COMM_SPEAKER: u32 = 0x0306;
+                const USB_TERMINAL_LFE_SPEAKER: u32 = 0x0307;
+
+                return Some(match terminal_type {
+                    // FourCC format (from AudioHardware.h)
+                    t if t == kAudioStreamTerminalTypeSpeaker => crate::DeviceType::Speaker,
+                    t if t == kAudioStreamTerminalTypeLFESpeaker => crate::DeviceType::Speaker,
+                    t if t == kAudioStreamTerminalTypeReceiverSpeaker => crate::DeviceType::Earpiece,
+                    t if t == kAudioStreamTerminalTypeHeadphones => crate::DeviceType::Headphones,
+                    t if t == kAudioStreamTerminalTypeMicrophone => crate::DeviceType::Microphone,
+                    t if t == kAudioStreamTerminalTypeHeadsetMicrophone => crate::DeviceType::Headset,
+                    t if t == kAudioStreamTerminalTypeReceiverMicrophone => crate::DeviceType::Microphone,
+                    t if t == kAudioStreamTerminalTypeLine => crate::DeviceType::Unknown,
+                    // USB Audio Terminal Types
+                    USB_TERMINAL_MICROPHONE
+                    | USB_TERMINAL_DESKTOP_MIC
+                    | USB_TERMINAL_PERSONAL_MIC
+                    | USB_TERMINAL_OMNI_MIC
+                    | USB_TERMINAL_MIC_ARRAY
+                    | USB_TERMINAL_PROC_MIC_ARRAY => crate::DeviceType::Microphone,
+                    USB_TERMINAL_SPEAKER
+                    | USB_TERMINAL_DESKTOP_SPEAKER
+                    | USB_TERMINAL_ROOM_SPEAKER
+                    | USB_TERMINAL_COMM_SPEAKER
+                    | USB_TERMINAL_LFE_SPEAKER => crate::DeviceType::Speaker,
+                    USB_TERMINAL_HEADPHONES | USB_TERMINAL_HMD_AUDIO => crate::DeviceType::Headphones,
+                    _ => crate::DeviceType::Unknown,
+                });
+            }
+        }
+
+        None
+    }
+
     fn description(&self) -> Result<crate::DeviceDescription, DeviceNameError> {
         let name = get_device_name(self.audio_device_id).map_err(|err| {
             DeviceNameError::BackendSpecific {
@@ -397,23 +590,45 @@ impl Device {
             }
         })?;
 
-        let input_configs = self
+        // Check if device supports input and output by testing if we can get configs
+        let has_input = self
             .supported_input_configs()
-            .map(|configs| configs.count() as ChannelCount)
-            .ok();
-        let output_configs = self
+            .map(|mut configs| configs.next().is_some())
+            .unwrap_or(false);
+        let has_output = self
             .supported_output_configs()
-            .map(|configs| configs.count() as ChannelCount)
-            .ok();
+            .map(|mut configs| configs.next().is_some())
+            .unwrap_or(false);
 
-        let direction =
-            crate::device_description::direction_from_counts(input_configs, output_configs);
+        let direction = crate::device_description::direction_from_caps(has_input, has_output);
 
         let mut builder = crate::DeviceDescriptionBuilder::new(name).direction(direction);
 
-        // Check if this is an aggregate device
-        if self.is_aggregate_device() {
+        // Get the transport type (USB, Bluetooth, Built-in, etc.)
+        if let Some(interface_type) = self.get_transport_type() {
+            builder = builder.interface_type(interface_type);
+        } else if self.is_aggregate_device() {
+            // Fallback: Check if this is an aggregate device
             builder = builder.interface_type(crate::InterfaceType::Aggregate);
+        }
+
+        // Get the device type (Speaker, Microphone, Headphones, etc.)
+        // Try input scope first, then output scope
+        let device_type = if has_input {
+            self.get_device_type(kAudioObjectPropertyScopeInput)
+        } else {
+            None
+        }
+        .or_else(|| {
+            if has_output {
+                self.get_device_type(kAudioObjectPropertyScopeOutput)
+            } else {
+                None
+            }
+        });
+
+        if let Some(device_type) = device_type {
+            builder = builder.device_type(device_type);
         }
 
         Ok(builder.build())
