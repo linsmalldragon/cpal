@@ -13,6 +13,7 @@
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::HostId;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 fn main() -> Result<(), anyhow::Error> {
@@ -49,11 +50,26 @@ fn run_macos_example() -> Result<(), anyhow::Error> {
     let sample_format = supported_config.sample_format();
     let config: cpal::StreamConfig = supported_config.into();
 
+    // Prepare buffer to store captured audio so we can write it to a WAV file later.
+    // We assume f32 samples, matching the `as_slice::<f32>()` below.
+    let recorded_samples = Arc::new(Mutex::new(Vec::<f32>::new()));
+    let recorded_for_cb = recorded_samples.clone();
+
+    // Cache WAV metadata derived from the stream config.
+    let wav_channels = config.channels;
+    let wav_sample_rate = config.sample_rate;
+
     let stream = device.build_input_stream_raw(
         &config,
         sample_format,
         move |data: &cpal::Data, _: &cpal::InputCallbackInfo| {
             if let Some(samples) = data.as_slice::<f32>() {
+                // Append samples to our recording buffer.
+                if let Ok(mut buf) = recorded_for_cb.lock() {
+                    buf.extend_from_slice(samples);
+                }
+
+                // Simple RMS meter for visual feedback.
                 let len = samples.len();
                 let rms: f32 = (samples.iter().map(|s| s * s).sum::<f32>() / len as f32).sqrt();
                 if rms > 0.001 {
@@ -159,7 +175,36 @@ fn run_macos_example() -> Result<(), anyhow::Error> {
     std::thread::sleep(Duration::from_secs(3));
 
     println!("\n=== Demo Complete! ===");
-    stream.pause()?;
+    if let Err(e) = stream.pause() {
+        eprintln!("Warning: failed to pause stream: {e:?}");
+    }
+
+    // After the demo is complete, dump all captured audio to a WAV file so it can be inspected.
+    // The file will be written next to the crate's Cargo.toml.
+    {
+        let samples = recorded_samples.lock().unwrap();
+        if !samples.is_empty() {
+            let path = concat!(env!("CARGO_MANIFEST_DIR"), "/dynamic_filter_update.wav");
+            println!("Writing captured audio to WAV file: {path}");
+
+            let spec = hound::WavSpec {
+                channels: wav_channels,
+                sample_rate: wav_sample_rate,
+                bits_per_sample: 32,
+                sample_format: hound::SampleFormat::Float,
+            };
+
+            let mut writer = hound::WavWriter::create(path, spec)?;
+            for &s in samples.iter() {
+                writer.write_sample(s)?;
+            }
+            writer.finalize()?;
+
+            println!("✅ Saved captured audio to {path}");
+        } else {
+            println!("⚠️ No audio samples were captured, skipping WAV export");
+        }
+    }
 
     Ok(())
 }

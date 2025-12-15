@@ -710,7 +710,40 @@ extern "C" {
         totalLengthOut: *mut usize,
         dataPointerOut: *mut *mut u8,
     ) -> i32;
+    fn CMSampleBufferGetFormatDescription(sbuf: &CMSampleBuffer) -> *const std::ffi::c_void;
 }
+
+#[link(name = "CoreAudio", kind = "framework")]
+extern "C" {
+    fn CMAudioFormatDescriptionGetStreamBasicDescription(
+        desc: *const std::ffi::c_void,
+    ) -> *const AudioStreamBasicDescription;
+}
+
+/// AudioStreamBasicDescription from CoreAudio
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+#[allow(non_snake_case)]
+struct AudioStreamBasicDescription {
+    mSampleRate: f64,
+    mFormatID: u32,
+    mFormatFlags: u32,
+    mBytesPerPacket: u32,
+    mFramesPerPacket: u32,
+    mBytesPerFrame: u32,
+    mChannelsPerFrame: u32,
+    mBitsPerChannel: u32,
+    mReserved: u32,
+}
+
+// Audio format flags
+#[allow(non_upper_case_globals)]
+const kAudioFormatFlagIsFloat: u32 = 1 << 0;
+#[allow(non_upper_case_globals)]
+const kAudioFormatFlagIsNonInterleaved: u32 = 1 << 5;
+
+// Global flag to print format info only once (across all threads)
+static FORMAT_PRINTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[link(name = "System", kind = "dylib")]
 extern "C" {
@@ -727,6 +760,40 @@ impl CapturerInner {
             if num_samples == 0 {
                 return;
             }
+
+            // Get format description to check if non-interleaved
+            let format_desc = CMSampleBufferGetFormatDescription(sample_buf);
+            let is_non_interleaved = if !format_desc.is_null() {
+                let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(format_desc);
+                if !asbd.is_null() {
+                    let asbd = &*asbd;
+                    // Print format info only once (for debugging)
+                    if !FORMAT_PRINTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        eprintln!("=== ScreenCaptureKit Audio Format ===");
+                        eprintln!("  Sample Rate: {} Hz", asbd.mSampleRate);
+                        eprintln!("  Channels: {}", asbd.mChannelsPerFrame);
+                        eprintln!("  Bits per Channel: {}", asbd.mBitsPerChannel);
+                        eprintln!("  Bytes per Frame: {}", asbd.mBytesPerFrame);
+                        eprintln!("  Bytes per Packet: {}", asbd.mBytesPerPacket);
+                        eprintln!("  Frames per Packet: {}", asbd.mFramesPerPacket);
+                        eprintln!("  Format Flags: 0x{:08x}", asbd.mFormatFlags);
+                        eprintln!(
+                            "    Is Float: {}",
+                            (asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0
+                        );
+                        eprintln!(
+                            "    Is Non-Interleaved: {}",
+                            (asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0
+                        );
+                        eprintln!("======================================");
+                    }
+                    (asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
 
             let timestamp = CMSampleBufferGetPresentationTimeStamp(sample_buf);
             let instant = host_time_to_stream_instant(timestamp);
@@ -755,8 +822,22 @@ impl CapturerInner {
             let floats_len = total_length / 4;
             let samples = std::slice::from_raw_parts(float_ptr, floats_len);
 
-            self.current_data.resize(floats_len, 0.0);
-            self.current_data.copy_from_slice(samples);
+            // Handle non-interleaved (planar) format by converting to interleaved
+            if is_non_interleaved && self.config.channels == 2 {
+                // Non-interleaved: [L0, L1, ..., Ln] [R0, R1, ..., Rn]
+                // Need to convert to interleaved: [L0, R0, L1, R1, ..., Ln, Rn]
+                let frames = floats_len / 2;
+                self.current_data.resize(floats_len, 0.0);
+                let left_channel = &samples[..frames];
+                let right_channel = &samples[frames..];
+                for i in 0..frames {
+                    self.current_data[i * 2] = left_channel[i];
+                    self.current_data[i * 2 + 1] = right_channel[i];
+                }
+            } else {
+                self.current_data.resize(floats_len, 0.0);
+                self.current_data.copy_from_slice(samples);
+            }
 
             // Callback
             let callback_info = InputCallbackInfo {
