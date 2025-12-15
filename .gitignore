@@ -3,6 +3,7 @@
 .cargo/
 .DS_Store
 recorded.wav
+dynamic_filter_update.wav
 rls*.log
 /.direnv
 !/examples/audioworklet-beep/.cargo/
