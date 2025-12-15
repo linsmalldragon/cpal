@@ -94,9 +94,6 @@ impl HostTrait for Host {
 #[derive(Clone)]
 pub struct Device {
     display_id: u32,
-    excluded_apps_pids: Vec<i32>,
-    /// App names to exclude (matched at stream build time)
-    excluded_app_names: Vec<String>,
 }
 
 unsafe impl Send for Device {}
@@ -188,47 +185,7 @@ impl DeviceTrait for Device {
 impl Device {
     pub fn new(display: Retained<SCDisplay>) -> Self {
         let display_id = unsafe { display.displayID() };
-        Self {
-            display_id,
-            excluded_apps_pids: Vec::new(),
-            excluded_app_names: Vec::new(),
-        }
-    }
-
-    /// Set excluded apps by SCRunningApplication references (advanced API)
-    pub fn set_excluded_apps(&mut self, apps: &[Retained<SCRunningApplication>]) {
-        self.excluded_apps_pids = apps.iter().map(|a| unsafe { a.processID() }).collect();
-    }
-
-    /// Set excluded apps by name (simple API, recommended)
-    ///
-    /// App names are matched against running applications when building the stream.
-    /// Uses a cached list of running apps for performance.
-    ///
-    /// # Example
-    /// ```ignore
-    /// device.set_excluded_app_names(&["QQ音乐", "微信"]);
-    /// ```
-    pub fn set_excluded_apps_pids(&mut self, pids: &[i32]) {
-        self.excluded_apps_pids = pids.to_vec();
-    }
-
-    /// Set excluded apps by name (simple API, recommended)
-    ///
-    /// App names are matched against running applications when building the stream.
-    /// Uses a cached list of running apps for performance.
-    ///
-    /// # Example
-    /// ```ignore
-    /// device.set_excluded_app_names(&["QQ音乐", "微信"]);
-    /// ```
-    pub fn set_excluded_app_names(&mut self, names: &[&str]) {
-        self.excluded_app_names = names.iter().map(|s| s.to_string()).collect();
-    }
-
-    /// Get the list of excluded app names
-    pub fn excluded_app_names(&self) -> &[String] {
-        &self.excluded_app_names
+        Self { display_id }
     }
 
     fn supported_input_configs(
@@ -302,15 +259,17 @@ impl Device {
         // Resolve excluded app names/PIDs to SCRunningApplication objects
         let mut excluded_apps_refs: Vec<Retained<SCRunningApplication>> = Vec::new();
 
-        // 1. Resolve by names associated with this device config
-        if !self.excluded_app_names.is_empty() {
-            let matched_apps = enumerate::find_apps_by_name_substrings(&self.excluded_app_names);
-            excluded_apps_refs.extend(matched_apps);
+        // 1. Resolve by names from StreamConfig
+        if let Some(ref excluded_names) = config.excluded_app_names {
+            if !excluded_names.is_empty() {
+                let matched_apps = enumerate::find_apps_by_name_substrings(excluded_names);
+                excluded_apps_refs.extend(matched_apps);
+            }
         }
 
-        // 2. Resolve by PIDs associated with this device config
-        if !self.excluded_apps_pids.is_empty() {
-            for pid in &self.excluded_apps_pids {
+        // 2. Resolve by PIDs from StreamConfig
+        if let Some(ref excluded_pids) = config.excluded_app_pids {
+            for pid in excluded_pids {
                 if let Some(app) = enumerate::get_running_application_by_pid(*pid) {
                     excluded_apps_refs.push(app);
                 }

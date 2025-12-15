@@ -338,8 +338,9 @@ impl std::str::FromStr for DeviceId {
 /// [`BufferSize::Fixed(x)`]: BufferSize::Fixed
 /// [`SupportedBufferSize`]: SupportedStreamConfig::buffer_size
 /// [`SupportedStreamConfig`]: SupportedStreamConfig
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
 pub enum BufferSize {
+    #[default]
     Default,
     Fixed(FrameCount),
 }
@@ -395,11 +396,17 @@ impl wasm_bindgen::convert::FromWasmAbi for BufferSize {
     ),
     wasm_bindgen
 )]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Default)]
 pub struct StreamConfig {
     pub channels: ChannelCount,
     pub sample_rate: SampleRate,
     pub buffer_size: BufferSize,
+    /// Excluded application PIDs (macOS ScreenCaptureKit only).
+    /// Audio from these applications will be excluded from capture.
+    pub excluded_app_pids: Option<Vec<i32>>,
+    /// Excluded application names (macOS ScreenCaptureKit only).
+    /// Audio from applications whose names contain these substrings will be excluded.
+    pub excluded_app_names: Option<Vec<String>>,
 }
 
 /// Describes the minimum and maximum supported buffer size for the device
@@ -567,6 +574,8 @@ impl SupportedStreamConfig {
             channels: self.channels,
             sample_rate: self.sample_rate,
             buffer_size: BufferSize::Default,
+            excluded_app_pids: None,
+            excluded_app_names: None,
         }
     }
 }

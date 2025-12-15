@@ -4,6 +4,7 @@
 .DS_Store
 recorded.wav
 dynamic_filter_update.wav
+macos_screencapture.wav
 rls*.log
 /.direnv
 !/examples/audioworklet-beep/.cargo/
