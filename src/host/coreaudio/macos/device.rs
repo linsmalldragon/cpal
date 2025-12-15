@@ -693,6 +693,8 @@ impl Device {
             let buffer_size = get_io_buffer_frame_size_range(&audio_unit)?;
 
             let config = SupportedStreamConfig {
+                excluded_app_names: None,
+                excluded_app_bundle_ids: None,
                 sample_rate: asbd.mSampleRate as _,
                 channels: asbd.mChannelsPerFrame as _,
                 buffer_size,

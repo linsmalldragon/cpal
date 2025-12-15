@@ -276,6 +276,14 @@ impl Device {
             }
         }
 
+        // 3. Resolve by bundle IDs from StreamConfig
+        if let Some(ref excluded_bundle_ids) = config.excluded_app_bundle_ids {
+            if !excluded_bundle_ids.is_empty() {
+                let matched_apps = enumerate::find_apps_by_bundle_ids(excluded_bundle_ids);
+                excluded_apps_refs.extend(matched_apps);
+            }
+        }
+
         let filter: Retained<SCContentFilter> = if excluded_apps_refs.is_empty() {
             unsafe {
                 let ptr: *mut SCContentFilter = msg_send![class!(SCContentFilter), alloc];

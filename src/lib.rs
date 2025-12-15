@@ -407,6 +407,10 @@ pub struct StreamConfig {
     /// Excluded application names (macOS ScreenCaptureKit only).
     /// Audio from applications whose names contain these substrings will be excluded.
     pub excluded_app_names: Option<Vec<String>>,
+    /// Excluded application bundle IDs (macOS ScreenCaptureKit only).
+    /// Audio from applications whose bundle IDs match these identifiers will be excluded.
+    /// Bundle IDs are like "com.tencent.QQMusicMac", "com.apple.Safari", etc.
+    pub excluded_app_bundle_ids: Option<Vec<String>>,
 }
 
 /// Describes the minimum and maximum supported buffer size for the device
@@ -465,6 +469,13 @@ pub struct SupportedStreamConfig {
     sample_rate: SampleRate,
     buffer_size: SupportedBufferSize,
     sample_format: SampleFormat,
+    /// Initial excluded application names (macOS ScreenCaptureKit only).
+    /// These will be copied into the resulting `StreamConfig` produced by [`SupportedStreamConfig::config`]
+    /// or the `From<SupportedStreamConfig> for StreamConfig` implementation.
+    excluded_app_names: Option<Vec<String>>,
+    /// Initial excluded application bundle IDs (macOS ScreenCaptureKit only).
+    /// These will be copied into the resulting `StreamConfig`.
+    excluded_app_bundle_ids: Option<Vec<String>>,
 }
 
 /// A buffer of dynamically typed audio data, passed to raw stream callbacks.
@@ -550,6 +561,8 @@ impl SupportedStreamConfig {
             sample_rate,
             buffer_size,
             sample_format,
+            excluded_app_names: None,
+            excluded_app_bundle_ids: None,
         }
     }
 
@@ -569,13 +582,30 @@ impl SupportedStreamConfig {
         self.sample_format
     }
 
+    /// Set initial excluded application names (macOS ScreenCaptureKit only).
+    ///
+    /// These names will be propagated into the resulting `StreamConfig` when
+    /// calling [`SupportedStreamConfig::config`] or using `into()`.
+    pub fn excluded_app_names(&mut self, names: Vec<String>) {
+        self.excluded_app_names = Some(names);
+    }
+
+    /// Set initial excluded application bundle IDs (macOS ScreenCaptureKit only).
+    ///
+    /// These bundle IDs will be propagated into the resulting `StreamConfig` when
+    /// calling [`SupportedStreamConfig::config`] or using `into()`.
+    pub fn excluded_app_bundle_ids(&mut self, bundle_ids: Vec<String>) {
+        self.excluded_app_bundle_ids = Some(bundle_ids);
+    }
+
     pub fn config(&self) -> StreamConfig {
         StreamConfig {
             channels: self.channels,
             sample_rate: self.sample_rate,
             buffer_size: BufferSize::Default,
             excluded_app_pids: None,
-            excluded_app_names: None,
+            excluded_app_names: self.excluded_app_names.clone(),
+            excluded_app_bundle_ids: self.excluded_app_bundle_ids.clone(),
         }
     }
 }
@@ -825,6 +855,8 @@ impl SupportedStreamConfigRange {
                 sample_rate,
                 sample_format: self.sample_format,
                 buffer_size: self.buffer_size,
+                excluded_app_names: None,
+                excluded_app_bundle_ids: None,
             })
         } else {
             None
@@ -839,6 +871,8 @@ impl SupportedStreamConfigRange {
             sample_rate: self.max_sample_rate,
             sample_format: self.sample_format,
             buffer_size: self.buffer_size,
+            excluded_app_names: None,
+            excluded_app_bundle_ids: None,
         }
     }
 

@@ -39,20 +39,20 @@ fn run_macos_example() -> Result<(), anyhow::Error> {
 
     // 3. Configure stream with excluded apps
     let t2 = Instant::now();
-    let supported_config = device.default_input_config().unwrap();
+    let mut supported_config = device.default_input_config().unwrap();
     println!("[TIMING] default_input_config(): {:?}", t2.elapsed());
 
     println!("Default config: {:?}", supported_config);
     let sample_format = supported_config.sample_format();
 
-    // Get StreamConfig and set excluded apps on it
-    let mut config: cpal::StreamConfig = supported_config.into();
-
-    // Set excluded apps by name in StreamConfig (the new API!)
+    // 在 SupportedStreamConfig 上直接设置需要排除的应用
     println!("\n=== Setting up app exclusion ===");
     let excluded_apps = vec!["QQ音乐".to_string()]; // 只排除 QQ音乐
     println!("🔇 Will exclude apps matching: {:?}", excluded_apps);
-    config.excluded_app_names = Some(excluded_apps);
+    supported_config.excluded_app_names(excluded_apps);
+
+    // 将配置转换为 StreamConfig，用于后续创建流
+    let config: cpal::StreamConfig = supported_config.into();
 
     // Prepare buffer to store captured audio so we can write it to a WAV file later.
     // We assume f32 samples, matching the `as_slice::<f32>()` below.
