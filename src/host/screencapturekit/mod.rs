@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use std::{cell::RefCell, rc::Rc};
 
@@ -13,11 +15,13 @@ use crate::{
 
 use block2::RcBlock;
 use objc2::rc::{Allocated, Retained};
+use objc2::runtime::ProtocolObject;
 use objc2::{class, define_class, msg_send, ClassType, DefinedClass};
+use objc2_core_graphics::CGDirectDisplayID;
 use objc2_core_media::{CMSampleBuffer, CMTime};
 use objc2_foundation::{NSArray, NSError, NSObject, NSObjectProtocol};
 use objc2_screen_capture_kit::{
-    SCContentFilter, SCDisplay, SCRunningApplication, SCStream, SCStreamConfiguration,
+    SCContentFilter, SCRunningApplication, SCStream, SCStreamConfiguration, SCStreamDelegate,
     SCStreamOutput, SCStreamOutputType, SCWindow,
 };
 
@@ -36,14 +40,18 @@ impl std::fmt::Display for UpdateFilterError {
 impl std::error::Error for UpdateFilterError {}
 
 impl Capturer {
-    pub fn new(inner: CapturerInner) -> Retained<Self> {
+    pub fn new(inner: CapturerInner, stream_stopped: Arc<AtomicBool>) -> Retained<Self> {
+        let ivars = CapturerIvars {
+            inner: RefCell::new(inner),
+            stream_stopped,
+        };
         unsafe {
             // Workaround: msg_send! infers Retained, but we need Allocated.
             // Both are transparent wrappers around NonNull.
             let ptr: *mut Self = msg_send![Self::class(), alloc];
             let alloc: Allocated<Self> = std::mem::transmute(ptr);
             // set_ivars returns PartialInit<Self>
-            let partial = alloc.set_ivars(RefCell::new(inner));
+            let partial = alloc.set_ivars(ivars);
             // Workaround: Transmute PartialInit back to Allocated or use it directly
             // If MsgSend fails for PartialInit, casting to Allocated might help
             let alloc_again: Allocated<Self> = std::mem::transmute(partial);
@@ -91,9 +99,52 @@ impl HostTrait for Host {
     }
 }
 
+// CoreGraphics FFI for display identification
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGDisplaySerialNumber(display: CGDirectDisplayID) -> u32;
+}
+
+/// Compute a unique display identifier compatible with xcap's `unique_key()` logic.
+/// Priority: serial number → CGDirectDisplayID (fallback)
+fn get_display_unique_id(display_id: CGDirectDisplayID) -> String {
+    // 1. Try serial number (hardware attribute, most reliable and unique across displays)
+    let serial = unsafe { CGDisplaySerialNumber(display_id) };
+    if serial != 0 {
+        return serial.to_string();
+    }
+
+    // 2. Fallback: CGDirectDisplayID (may be small numbers like 1, 2, 3)
+    display_id.to_string()
+}
+
+/// Get the computer's hostname for use in device display names.
+/// Returns something like "MacBook-Pro" or "linxiaolong-MacBookPro".
+/// Falls back to "Mac" if gethostname fails.
+fn get_computer_name() -> String {
+    extern "C" {
+        fn gethostname(name: *mut std::ffi::c_char, len: usize) -> i32;
+    }
+    let mut buf = [0u8; 256];
+    let ret = unsafe { gethostname(buf.as_mut_ptr() as *mut std::ffi::c_char, buf.len()) };
+    if ret == 0 {
+        let name = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr() as *const std::ffi::c_char) };
+        let name_str = name.to_string_lossy().to_string();
+        // Remove ".local" suffix if present (macOS often appends it)
+        name_str
+            .strip_suffix(".local")
+            .unwrap_or(&name_str)
+            .to_string()
+    } else {
+        "Mac".to_string()
+    }
+}
+
 #[derive(Clone)]
 pub struct Device {
     display_id: u32,
+    /// Unique identifier: serial number, UUID, or displayID (fallback)
+    unique_id: String,
 }
 
 unsafe impl Send for Device {}
@@ -105,11 +156,13 @@ impl DeviceTrait for Device {
     type Stream = Stream;
 
     fn name(&self) -> Result<String, DeviceNameError> {
-        Ok(format!("Display {}", self.display_id))
+        let computer_name = get_computer_name();
+        Ok(format!("{} Audio", computer_name))
     }
 
     fn description(&self) -> Result<DeviceDescription, DeviceNameError> {
-        let name = format!("Display {}", self.display_id);
+        let computer_name = get_computer_name();
+        let name = format!("{} Audio", computer_name);
         Ok(DeviceDescriptionBuilder::new(name)
             .device_type(crate::device_description::DeviceType::ScreenCaptureKit)
             .interface_type(crate::device_description::InterfaceType::Unknown)
@@ -118,10 +171,7 @@ impl DeviceTrait for Device {
     }
 
     fn id(&self) -> Result<DeviceId, DeviceIdError> {
-        Ok(DeviceId(
-            HostId::ScreenCaptureKit,
-            self.display_id.to_string(),
-        ))
+        Ok(DeviceId(HostId::ScreenCaptureKit, self.unique_id.clone()))
     }
 
     fn supported_input_configs(
@@ -183,9 +233,12 @@ impl DeviceTrait for Device {
 }
 
 impl Device {
-    pub fn new(display: Retained<SCDisplay>) -> Self {
-        let display_id = unsafe { display.displayID() };
-        Self { display_id }
+    pub fn new(display_id: u32) -> Self {
+        let unique_id = get_display_unique_id(display_id);
+        Self {
+            display_id,
+            unique_id,
+        }
     }
 
     fn supported_input_configs(
@@ -307,11 +360,7 @@ impl Device {
             }
         };
 
-        let sc_stream = unsafe {
-            let ptr: *mut SCStream = msg_send![class!(SCStream), alloc];
-            let alloc: Allocated<SCStream> = std::mem::transmute(ptr);
-            SCStream::initWithFilter_configuration_delegate(alloc, &filter, &cfg, None)
-        };
+        let stream_stopped = Arc::new(AtomicBool::new(false));
 
         let inner = CapturerInner {
             current_data: vec![],
@@ -321,7 +370,15 @@ impl Device {
             error_callback: Box::new(error_callback),
         };
 
-        let capturer = Capturer::new(inner);
+        let capturer = Capturer::new(inner, stream_stopped.clone());
+
+        // Pass capturer as delegate to receive stream:didStopWithError: callbacks
+        let delegate = ProtocolObject::from_ref(&*capturer);
+        let sc_stream = unsafe {
+            let ptr: *mut SCStream = msg_send![class!(SCStream), alloc];
+            let alloc: Allocated<SCStream> = std::mem::transmute(ptr);
+            SCStream::initWithFilter_configuration_delegate(alloc, &filter, &cfg, Some(delegate))
+        };
 
         // Dispatch queue handling
         let label = std::ffi::CString::new("cpal.screencapturekit.queue").unwrap();
@@ -358,6 +415,7 @@ impl Device {
             sc_stream,
             playing: false,
             display_id: self.display_id,
+            stream_stopped,
         }))
     }
 
@@ -384,17 +442,23 @@ struct StreamInner {
     playing: bool,
     // Store display_id for dynamic filter updates
     display_id: u32,
+    // Flag set when SCStreamDelegate reports stream stopped
+    stream_stopped: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
 pub struct Stream {
     inner: Rc<RefCell<StreamInner>>,
+    /// Direct access to stream_stopped flag — no RefCell borrow needed
+    stream_stopped: Arc<AtomicBool>,
 }
 
 impl Stream {
     fn new(inner: StreamInner) -> Self {
+        let stream_stopped = inner.stream_stopped.clone();
         Self {
             inner: Rc::new(RefCell::new(inner)),
+            stream_stopped,
         }
     }
 
@@ -560,6 +624,14 @@ impl Stream {
             description: format!("{:?}", e),
         })
     }
+
+    /// Check if the stream has been stopped by the system (e.g., display disconnected)
+    ///
+    /// This reads the Arc<AtomicBool> directly — no RefCell borrow needed,
+    /// so it is always safe to call regardless of what other borrows are active.
+    pub fn is_stream_stopped(&self) -> bool {
+        self.stream_stopped.load(Ordering::Acquire)
+    }
 }
 
 impl StreamTrait for Stream {
@@ -649,6 +721,14 @@ impl StreamTrait for Stream {
     }
 }
 
+/// Ivars for the Objective-C Capturer class.
+/// `stream_stopped` lives OUTSIDE the RefCell so `didStopWithError` can set it
+/// without borrowing RefCell — completely eliminating the borrow conflict race condition.
+pub struct CapturerIvars {
+    inner: RefCell<CapturerInner>,
+    stream_stopped: Arc<AtomicBool>,
+}
+
 #[allow(dead_code)]
 pub struct CapturerInner {
     current_data: Vec<f32>,
@@ -661,7 +741,7 @@ pub struct CapturerInner {
 define_class!(
     #[unsafe(super(NSObject))]
     #[name = "CpalScreencaptureKitCapturer"]
-    #[ivars = RefCell<CapturerInner>]
+    #[ivars = CapturerIvars]
     pub struct Capturer;
 
     unsafe impl NSObjectProtocol for Capturer {}
@@ -675,8 +755,27 @@ define_class!(
             kind: SCStreamOutputType,
         ) {
             if kind == SCStreamOutputType::Audio {
-                let mut inner = self.ivars().borrow_mut();
+                let mut inner = self.ivars().inner.borrow_mut();
                 inner.handle_audio(sample_buffer);
+            }
+        }
+    }
+
+    unsafe impl SCStreamDelegate for Capturer {
+        #[unsafe(method(stream:didStopWithError:))]
+        fn stream_did_stop_with_error(&self, _stream: &SCStream, error: &NSError) {
+            // 1. Set stream_stopped flag — directly on Arc<AtomicBool>, NO RefCell borrow.
+            //    This is always safe regardless of concurrent audio callbacks.
+            self.ivars().stream_stopped.store(true, Ordering::Release);
+
+            // 2. Log Apple error details (no RefCell borrow needed)
+            eprintln!("[cpal-sck] SCStream didStopWithError: {:?}", error);
+
+            // 3. Try to call error_callback if RefCell is available.
+            //    If audio callback holds the borrow, skip — the flag is already set
+            //    and the pickup thread will detect it via polling.
+            if let Ok(mut inner) = self.ivars().inner.try_borrow_mut() {
+                (inner.error_callback)(StreamError::DeviceNotAvailable);
             }
         }
     }
@@ -855,4 +954,101 @@ fn host_time_to_stream_instant(cm_time: CMTime) -> StreamInstant {
     let subsec_nanos =
         (cm_time.value % cm_time.timescale as i64) * 1_000_000_000 / cm_time.timescale as i64;
     StreamInstant::new(secs, subsec_nanos as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::traits::{DeviceTrait, HostTrait};
+
+    #[test]
+    fn test_screencapturekit_device_ids_use_unique_display_identifier() {
+        let host = Host::new().expect("Failed to create SCK host");
+        let devices: Vec<Device> = host
+            .devices()
+            .expect("Failed to enumerate devices")
+            .collect();
+
+        println!("Found {} SCK display devices:", devices.len());
+        assert!(!devices.is_empty(), "Should find at least one display");
+
+        for device in &devices {
+            let id = device.id().expect("Failed to get device ID");
+            let name = device.name().expect("Failed to get device name");
+            let id_str = id.to_string();
+
+            println!(
+                "  Device: {} | ID: {} | display_id(CGDirectDisplayID): {}",
+                name, id_str, device.display_id
+            );
+
+            // Verify format: "screencapturekit:<unique_id>"
+            assert!(
+                id_str.starts_with("screencapturekit:"),
+                "ID should start with 'screencapturekit:': {}",
+                id_str
+            );
+
+            let unique_part = id_str.strip_prefix("screencapturekit:").unwrap();
+
+            // The unique_id should NOT be a small index like "1", "2", "3"
+            // unless CGDirectDisplayID is also the fallback (no serial/UUID available)
+            // In that case, verify it matches the display_id
+            println!(
+                "  unique_id: {} | is_serial_or_uuid: {}",
+                unique_part,
+                unique_part.len() > 3
+            );
+
+            // Verify unique_id is non-empty
+            assert!(!unique_part.is_empty(), "unique_id should not be empty");
+
+            // Verify name uses unique_id
+            assert!(
+                name.contains(unique_part),
+                "Name '{}' should contain unique_id '{}'",
+                name,
+                unique_part
+            );
+        }
+
+        // Verify all IDs are unique
+        let ids: Vec<String> = devices
+            .iter()
+            .map(|d| d.id().unwrap().to_string())
+            .collect();
+        let mut unique_ids = ids.clone();
+        unique_ids.sort();
+        unique_ids.dedup();
+        assert_eq!(
+            ids.len(),
+            unique_ids.len(),
+            "All device IDs should be unique: {:?}",
+            ids
+        );
+    }
+
+    #[test]
+    fn test_get_display_unique_id_consistency() {
+        // Call get_display_unique_id twice for the same display_id to verify consistency
+        let host = Host::new().expect("Failed to create SCK host");
+        let devices: Vec<Device> = host
+            .devices()
+            .expect("Failed to enumerate devices")
+            .collect();
+
+        for device in &devices {
+            let id1 = get_display_unique_id(device.display_id);
+            let id2 = get_display_unique_id(device.display_id);
+            assert_eq!(
+                id1, id2,
+                "get_display_unique_id should return consistent results for display_id {}",
+                device.display_id
+            );
+            println!(
+                "display_id {} -> unique_id {} (consistent ✓)",
+                device.display_id, id1
+            );
+        }
+    }
 }

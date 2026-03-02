@@ -744,8 +744,7 @@ mod platform_impl {
         Device as ScreenCaptureKitDevice, Devices as ScreenCaptureKitDevices,
         Host as ScreenCaptureKitHost, Stream as ScreenCaptureKitStream,
         SupportedInputConfigs as ScreenCaptureKitSupportedInputConfigs,
-        SupportedOutputConfigs as ScreenCaptureKitSupportedOutputConfigs,
-        UpdateFilterError,
+        SupportedOutputConfigs as ScreenCaptureKitSupportedOutputConfigs, UpdateFilterError,
     };
     impl_platform_host!(
         CoreAudio => CoreAudioHost,
@@ -837,10 +836,9 @@ mod platform_impl {
             };
 
             // Partition devices: non-Bluetooth-mic-speaker first, Bluetooth-mic-speaker last
-            let (preferred, bluetooth_mic_speaker): (Vec<_>, Vec<_>) =
-                input_devices.into_iter().partition(|device| {
-                    !is_bluetooth_mic_speaker(device)
-                });
+            let (preferred, bluetooth_mic_speaker): (Vec<_>, Vec<_>) = input_devices
+                .into_iter()
+                .partition(|device| !is_bluetooth_mic_speaker(device));
 
             // Prefer non-Bluetooth-mic-speaker devices
             if let Some(device) = preferred.into_iter().next() {
@@ -871,7 +869,10 @@ mod platform_impl {
         /// // Clear all exclusions
         /// stream.update_excluded_apps_by_names(&[])?;
         /// ```
-        pub fn update_excluded_apps_by_names(&self, names: &[&str]) -> Result<(), UpdateFilterError> {
+        pub fn update_excluded_apps_by_names(
+            &self,
+            names: &[&str],
+        ) -> Result<(), UpdateFilterError> {
             match &self.0 {
                 StreamInner::ScreenCaptureKit(s) => s.update_excluded_apps_by_names(names),
                 _ => Err(UpdateFilterError {
@@ -924,7 +925,10 @@ mod platform_impl {
         /// // Clear all exclusions
         /// stream.update_excluded_apps_by_bundle_ids(&[])?;
         /// ```
-        pub fn update_excluded_apps_by_bundle_ids(&self, bundle_ids: &[&str]) -> Result<(), UpdateFilterError> {
+        pub fn update_excluded_apps_by_bundle_ids(
+            &self,
+            bundle_ids: &[&str],
+        ) -> Result<(), UpdateFilterError> {
             match &self.0 {
                 StreamInner::ScreenCaptureKit(s) => s.update_excluded_apps_by_bundle_ids(bundle_ids),
                 _ => Err(UpdateFilterError {
@@ -938,6 +942,17 @@ mod platform_impl {
         /// Returns `true` if this stream was created from a ScreenCaptureKit device.
         pub fn is_screencapturekit(&self) -> bool {
             matches!(&self.0, StreamInner::ScreenCaptureKit(_))
+        }
+
+        /// Check if the stream has been stopped by the system (e.g., display disconnected)
+        ///
+        /// Returns `true` if the ScreenCaptureKit delegate received `didStopWithError`.
+        /// For non-SCK streams, always returns `false`.
+        pub fn is_stream_stopped(&self) -> bool {
+            match &self.0 {
+                StreamInner::ScreenCaptureKit(s) => s.is_stream_stopped(),
+                _ => false,
+            }
         }
     }
 }

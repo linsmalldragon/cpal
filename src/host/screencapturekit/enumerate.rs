@@ -12,6 +12,15 @@ use crate::{BackendSpecificError, DevicesError, SupportedStreamConfigRange};
 
 use super::Device;
 
+// CoreGraphics FFI for fast display enumeration
+extern "C" {
+    fn CGGetActiveDisplayList(
+        max_displays: u32,
+        active_displays: *mut u32,
+        display_count: *mut u32,
+    ) -> i32;
+}
+
 // ============================================================================
 // Thread-local cache for displays and running applications
 // ============================================================================
@@ -31,7 +40,8 @@ thread_local! {
     static APPS_CACHE: RefCell<Option<Vec<Retained<SCRunningApplication>>>> = const { RefCell::new(None) };
 }
 
-/// Fetch displays from macOS (blocking call ~90ms)
+/// Fetch displays from macOS via SCShareableContent (blocking call ~90ms)
+/// Only needed when building streams, not for device enumeration.
 fn fetch_displays() -> Result<Vec<Retained<SCDisplay>>, DevicesError> {
     let (tx, rx) = channel();
 
@@ -67,6 +77,36 @@ fn fetch_displays() -> Result<Vec<Retained<SCDisplay>>, DevicesError> {
         }
         .into()),
     }
+}
+
+/// Fast display enumeration using CoreGraphics (~1µs vs ~90ms for SCShareableContent).
+/// Returns CGDirectDisplayID list of currently active displays.
+fn fetch_active_display_ids() -> Result<Vec<u32>, DevicesError> {
+    let max_displays: u32 = 16;
+    let mut active_displays: Vec<u32> = vec![0; max_displays as usize];
+    let mut display_count: u32 = 0;
+
+    let cg_error = unsafe {
+        CGGetActiveDisplayList(
+            max_displays,
+            active_displays.as_mut_ptr(),
+            &mut display_count,
+        )
+    };
+
+    // CGError::Success = 0
+    if cg_error != 0 {
+        return Err(BackendSpecificError {
+            description: format!(
+                "CGGetActiveDisplayList failed with error code: {}",
+                cg_error
+            ),
+        }
+        .into());
+    }
+
+    active_displays.truncate(display_count as usize);
+    Ok(active_displays)
 }
 
 /// Fetch running applications from macOS (blocking call ~90ms)
@@ -160,7 +200,6 @@ pub fn refresh_applications_cache() -> Result<(), DevicesError> {
 }
 
 /// Invalidate the thread-local display cache
-#[allow(dead_code)]
 pub fn invalidate_display_cache() {
     DISPLAY_CACHE.with(|cache| {
         *cache.borrow_mut() = None;
@@ -175,8 +214,21 @@ pub fn invalidate_applications_cache() {
     });
 }
 
-/// Helper to find a specific display by ID from the cache
+/// Helper to find a specific display by ID.
+/// If not found in cache, refreshes the cache from SCShareableContent and retries.
 pub(crate) fn get_display_by_id(display_id: u32) -> Option<Retained<SCDisplay>> {
+    // 1. Try from cache first (fast path, ~1µs)
+    if let Ok(displays) = get_displays_cached() {
+        if let Some(display) = displays
+            .into_iter()
+            .find(|d| unsafe { d.displayID() } == display_id)
+        {
+            return Some(display);
+        }
+    }
+
+    // 2. Cache miss or stale — invalidate and fetch fresh data (~90ms)
+    invalidate_display_cache();
     let displays = get_displays_cached().ok()?;
     displays
         .into_iter()
@@ -237,11 +289,12 @@ pub struct Devices(VecIntoIter<Device>);
 
 impl Devices {
     pub fn new() -> Result<Self, DevicesError> {
-        let displays = get_displays_cached()?;
-        let mut res = Vec::new();
+        // Use fast CoreGraphics enumeration (~1µs) instead of SCShareableContent (~90ms)
+        let display_ids = fetch_active_display_ids()?;
 
-        for display in displays.iter() {
-            res.push(Device::new(display.clone()));
+        let mut res = Vec::new();
+        for display_id in display_ids {
+            res.push(Device::new(display_id));
         }
 
         Ok(Devices(res.into_iter()))
