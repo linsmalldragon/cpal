@@ -61,20 +61,6 @@ const PKEY_AUDIOENDPOINT_JACKSUBTYPE: PROPERTYKEY = PROPERTYKEY {
     pid: 8,
 };
 
-// PKEY_AudioEndpoint properties not yet in windows-rs
-
-/// PKEY_AudioEndpoint_FormFactor (PID 0) - VT_UI4 containing EndpointFormFactor enum
-const PKEY_AUDIOENDPOINT_FORMFACTOR: PROPERTYKEY = PROPERTYKEY {
-    fmtid: GUID::from_u128(0x1da5d803_d492_4edd_8c23_e0c0ffee7f0e),
-    pid: 0,
-};
-
-/// PKEY_AudioEndpoint_JackSubType (PID 8) - VT_LPWSTR containing KS node type GUID
-const PKEY_AUDIOENDPOINT_JACKSUBTYPE: PROPERTYKEY = PROPERTYKEY {
-    fmtid: GUID::from_u128(0x1da5d803_d492_4edd_8c23_e0c0ffee7f0e),
-    pid: 8,
-};
-
 /// Wrapper because of that stupid decision to remove `Send` and `Sync` from raw pointers.
 #[derive(Clone)]
 struct IAudioClientWrapper(Audio::IAudioClient);
@@ -307,6 +293,8 @@ unsafe fn format_from_waveformatex_ptr(
         sample_rate,
         buffer_size,
         sample_format,
+        excluded_app_names: None,
+        excluded_app_bundle_ids: None,
     };
     Some(format)
 }
@@ -585,6 +573,9 @@ impl Device {
                             channels: format.channels,
                             sample_rate,
                             buffer_size: BufferSize::Default,
+                            excluded_app_pids: None,
+                            excluded_app_names: None,
+                            excluded_app_bundle_ids: None,
                         },
                         sample_format,
                     ) {
