@@ -79,6 +79,10 @@ pub enum DeviceType {
     //capture audio from screen
     ScreenCaptureKit,
 
+    /// System audio capture (loopback) — used by WasapiLoopback on Windows
+    /// and ScreenCaptureKit on macOS
+    SystemAudioCapture,
+
     /// Unknown or unclassified device type
     #[default]
     Unknown,
@@ -250,6 +254,8 @@ impl fmt::Display for DeviceType {
             DeviceType::Dock => write!(f, "Dock"),
             DeviceType::Tuner => write!(f, "Tuner"),
             DeviceType::Virtual => write!(f, "Virtual"),
+            DeviceType::ScreenCaptureKit => write!(f, "ScreenCaptureKit"),
+            DeviceType::SystemAudioCapture => write!(f, "SystemAudioCapture"),
             _ => write!(f, "Unknown"),
         }
     }

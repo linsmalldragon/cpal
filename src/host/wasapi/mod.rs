@@ -15,9 +15,9 @@ use crate::DevicesError;
 use std::io::Error as IoError;
 use windows::Win32::Media::Audio;
 
-mod com;
-mod device;
-mod stream;
+pub(crate) mod com;
+pub(crate) mod device;
+pub(crate) mod stream;
 
 /// The WASAPI host, the default windows host type.
 ///

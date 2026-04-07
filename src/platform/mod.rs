@@ -1017,10 +1017,13 @@ mod platform_impl {
     pub use crate::host::jack::Host as JackHost;
     #[cfg_attr(docsrs, doc(cfg(windows)))]
     pub use crate::host::wasapi::Host as WasapiHost;
+    #[cfg_attr(docsrs, doc(cfg(windows)))]
+    pub use crate::host::wasapi_loopback::Host as WasapiLoopbackHost;
 
     impl_platform_host!(
         #[cfg(feature = "asio")] Asio => AsioHost,
         Wasapi => WasapiHost,
+        WasapiLoopback => WasapiLoopbackHost,
         #[cfg(feature = "jack")] Jack => JackHost,
         #[cfg(feature = "custom")] Custom => super::CustomHost,
     );
@@ -1030,6 +1033,16 @@ mod platform_impl {
         WasapiHost::new()
             .expect("the default host should always be available")
             .into()
+    }
+
+    // WasapiLoopback-specific Stream extensions for Windows
+    impl Stream {
+        /// Check if this stream is a WasapiLoopback stream
+        ///
+        /// Returns `true` if this stream was created from a WasapiLoopback device.
+        pub fn is_wasapi_loopback(&self) -> bool {
+            matches!(&self.0, StreamInner::WasapiLoopback(_))
+        }
     }
 }
 

@@ -27,6 +27,8 @@ pub(crate) mod screencapturekit;
 
 #[cfg(windows)]
 pub(crate) mod wasapi;
+#[cfg(windows)]
+pub(crate) mod wasapi_loopback;
 #[cfg(all(target_arch = "wasm32", feature = "wasm-bindgen"))]
 pub(crate) mod webaudio;
 
