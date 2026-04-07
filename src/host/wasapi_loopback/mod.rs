@@ -42,10 +42,11 @@ use windows::Win32::Devices::Properties;
 use windows::Win32::Foundation::PROPERTYKEY;
 use windows::Win32::Media::{Audio, KernelStreaming, Multimedia};
 use windows::Win32::System::Com::{StructuredStorage, STGM_READ};
-use windows::Win32::System::Variant::{VT_LPWSTR, VT_UI4};
+use windows::Win32::System::Variant::{VT_BLOB, VT_LPWSTR, VT_UI4};
 use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
 
 mod enumerate;
+mod process;
 mod stream;
 
 /// PKEY_AudioEndpoint_FormFactor (PID 0)
@@ -504,23 +505,37 @@ impl Device {
         unsafe {
             com::com_initialized();
 
-            let audio_client = match self.build_audioclient() {
-                Ok(client) => client,
-                Err(ref e) if e.code() == Audio::AUDCLNT_E_DEVICE_INVALIDATED => {
-                    return Err(BuildStreamError::DeviceNotAvailable)
-                }
-                Err(e) => {
-                    let description = format!("{}", e);
-                    let err = BackendSpecificError { description };
-                    return Err(err.into());
+            // Determine capture mode: per-process loopback or classic loopback
+            let excluded_pid = resolve_excluded_pid(config);
+
+            let audio_client = if let Some(pid) = excluded_pid {
+                // Per-process loopback path: uses ActivateAudioInterfaceAsync
+                activate_process_loopback_audio_client(pid)?
+            } else {
+                // Classic loopback path: uses IMMDevice::Activate
+                match self.build_audioclient() {
+                    Ok(client) => client,
+                    Err(ref e) if e.code() == Audio::AUDCLNT_E_DEVICE_INVALIDATED => {
+                        return Err(BuildStreamError::DeviceNotAvailable)
+                    }
+                    Err(e) => {
+                        let description = format!("{}", e);
+                        let err = BackendSpecificError { description };
+                        return Err(err.into());
+                    }
                 }
             };
 
             let buffer_duration = buffer_size_to_duration(&config.buffer_size, config.sample_rate);
 
-            // Always use loopback mode — this is the purpose of this host
-            let stream_flags =
-                Audio::AUDCLNT_STREAMFLAGS_EVENTCALLBACK | Audio::AUDCLNT_STREAMFLAGS_LOOPBACK;
+            // Per-process loopback does NOT use AUDCLNT_STREAMFLAGS_LOOPBACK
+            // (the loopback is set up at activation level).
+            // Classic loopback requires the LOOPBACK flag.
+            let stream_flags = if excluded_pid.is_some() {
+                Audio::AUDCLNT_STREAMFLAGS_EVENTCALLBACK
+            } else {
+                Audio::AUDCLNT_STREAMFLAGS_EVENTCALLBACK | Audio::AUDCLNT_STREAMFLAGS_LOOPBACK
+            };
 
             let waveformatex = {
                 let format_attempt = config_to_waveformatextensible(config, sample_format)
@@ -895,6 +910,186 @@ unsafe fn get_property_string(
 
     StructuredStorage::PropVariantClear(&mut property_value).ok();
     result
+}
+
+// ============================================================================
+// Per-process loopback activation (Windows 10 2004+)
+// ============================================================================
+
+// Manual definitions for process loopback types not yet in the `windows` crate.
+
+/// The virtual audio device path for process loopback activation.
+const VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK: &str = "VAD\\Process\\Loopback";
+
+/// Activation type for process loopback.
+const AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK: u32 = 0;
+
+/// Include only the target process's audio.
+#[allow(dead_code)]
+const PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE: u32 = 0;
+
+/// Exclude the target process's audio (capture everything else).
+const PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE: u32 = 1;
+
+#[repr(C)]
+struct AudioClientProcessLoopbackParams {
+    target_process_id: u32,
+    process_loopback_mode: u32,
+}
+
+#[repr(C)]
+struct AudioClientActivationParams {
+    activation_type: u32,
+    process_loopback_params: AudioClientProcessLoopbackParams,
+}
+
+/// COM completion handler for `ActivateAudioInterfaceAsync`.
+///
+/// Implements `IActivateAudioInterfaceCompletionHandler` and signals completion
+/// via a oneshot channel.
+#[windows::core::implement(Audio::IActivateAudioInterfaceCompletionHandler)]
+struct ActivationCompletionHandler {
+    tx: std::sync::Mutex<Option<std::sync::mpsc::Sender<Result<Audio::IAudioClient, windows::core::Error>>>>,
+}
+
+impl Audio::IActivateAudioInterfaceCompletionHandler_Impl for ActivationCompletionHandler_Impl {
+    fn ActivateCompleted(
+        &self,
+        activate_operation: windows::core::Ref<'_, Audio::IActivateAudioInterfaceAsyncOperation>,
+    ) -> windows::core::Result<()> {
+        let result = unsafe {
+            let mut hr = windows::Win32::Foundation::E_FAIL;
+            let mut activated_interface: Option<windows::core::IUnknown> = None;
+            let op: Audio::IActivateAudioInterfaceAsyncOperation = activate_operation.clone().unwrap();
+            op.GetActivateResult(&mut hr, &mut activated_interface)?;
+            hr.ok()?;
+            match activated_interface {
+                Some(intf) => intf.cast::<Audio::IAudioClient>(),
+                None => Err(windows::core::Error::new(
+                    windows::Win32::Foundation::E_POINTER,
+                    "ActivateAudioInterfaceAsync returned null interface",
+                )),
+            }
+        };
+
+        if let Ok(mut tx_guard) = self.tx.lock() {
+            if let Some(tx) = tx_guard.take() {
+                let _ = tx.send(result);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Activate an `IAudioClient` for per-process loopback capture.
+///
+/// Uses `ActivateAudioInterfaceAsync` with `AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK`
+/// to get an audio client that captures all system audio EXCEPT the target process's audio.
+///
+/// Requires Windows 10 version 2004 (build 19041) or later.
+fn activate_process_loopback_audio_client(
+    target_pid: u32,
+) -> Result<Audio::IAudioClient, BuildStreamError> {
+    use std::sync::mpsc;
+
+    com::com_initialized();
+
+    // Set up activation params
+    let mut activation_params = AudioClientActivationParams {
+        activation_type: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
+        process_loopback_params: AudioClientProcessLoopbackParams {
+            target_process_id: target_pid,
+            process_loopback_mode: PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
+        },
+    };
+
+    // Wrap in PROPVARIANT (VT_BLOB)
+    let mut prop_variant = windows::Win32::System::Com::StructuredStorage::PROPVARIANT::default();
+    unsafe {
+        let inner = &mut prop_variant.Anonymous.Anonymous;
+        inner.vt = VT_BLOB;
+        inner.Anonymous.blob.cbSize =
+            std::mem::size_of::<AudioClientActivationParams>() as u32;
+        inner.Anonymous.blob.pBlobData =
+            &mut activation_params as *mut _ as *mut u8;
+    }
+
+    // Create completion handler
+    let (tx, rx) = mpsc::channel();
+    let handler: Audio::IActivateAudioInterfaceCompletionHandler =
+        ActivationCompletionHandler {
+            tx: std::sync::Mutex::new(Some(tx)),
+        }
+        .into();
+
+    // Convert device path to wide string
+    let device_path: Vec<u16> = VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let device_path_pcwstr = windows::core::PCWSTR(device_path.as_ptr());
+
+    // Call ActivateAudioInterfaceAsync
+    let _async_op = unsafe {
+        Audio::ActivateAudioInterfaceAsync(
+            device_path_pcwstr,
+            &Audio::IAudioClient::IID,
+            Some(&prop_variant),
+            &handler,
+        )
+        .map_err(|e| {
+            let description = format!(
+                "ActivateAudioInterfaceAsync failed (process loopback for PID {}): {}",
+                target_pid, e
+            );
+            BuildStreamError::from(BackendSpecificError { description })
+        })?
+    };
+
+    // Wait for completion (with timeout)
+    let audio_client = rx
+        .recv_timeout(Duration::from_secs(5))
+        .map_err(|_| {
+            let description = format!(
+                "ActivateAudioInterfaceAsync timed out for PID {}",
+                target_pid
+            );
+            BuildStreamError::from(BackendSpecificError { description })
+        })?
+        .map_err(|e| {
+            let description = format!(
+                "ActivateAudioInterfaceAsync failed for PID {}: {}",
+                target_pid, e
+            );
+            BuildStreamError::from(BackendSpecificError { description })
+        })?;
+
+    Ok(audio_client)
+}
+
+/// Resolve excluded app names/PIDs from a `StreamConfig` into a single target PID.
+///
+/// Returns `Some(pid)` if per-process loopback should be used, `None` for classic loopback.
+/// Windows per-process loopback only supports a single PID at a time.
+fn resolve_excluded_pid(config: &StreamConfig) -> Option<u32> {
+    // Check explicit PIDs first
+    if let Some(ref pids) = config.excluded_app_pids {
+        if let Some(&first_pid) = pids.first() {
+            return Some(first_pid as u32);
+        }
+    }
+
+    // Resolve app names to PIDs
+    if let Some(ref names) = config.excluded_app_names {
+        if !names.is_empty() {
+            let procs = process::find_pids_by_name_substrings(names);
+            if let Some(first) = procs.first() {
+                return Some(first.pid);
+            }
+        }
+    }
+
+    None
 }
 
 // ============================================================================
