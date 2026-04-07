@@ -76,6 +76,7 @@ windows = { version = ">=0.59, <=0.62", features = [
     "Win32_Media_Multimedia",
     "Win32_UI_Shell_PropertiesSystem",
     "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Performance",
 ] }
 windows-core = ">=0.59, <=0.62"
 windows-implement = ">=0.59, <=0.62"

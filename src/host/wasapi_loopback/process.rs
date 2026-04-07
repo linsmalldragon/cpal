@@ -123,3 +123,92 @@ fn wchar_array_to_string(wchars: &[u16]) -> String {
     let os_string = OsString::from_wide(&wchars[..len]);
     os_string.to_string_lossy().into_owned()
 }
+
+/// Deduplicate PIDs by removing those whose ancestor is already in the set.
+///
+/// Since `PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE` captures the entire
+/// process tree rooted at the target PID, having both a parent and its child in
+/// the list would cause the child's audio to be subtracted twice.
+///
+/// This function walks the parent chain of each PID (via a fresh process snapshot)
+/// and removes any PID whose ancestor is also in the set.
+pub fn deduplicate_pids_by_tree(pids: &[u32]) -> Vec<u32> {
+    if pids.len() <= 1 {
+        return pids.to_vec();
+    }
+
+    // Deduplicate exact duplicates first
+    let mut unique: Vec<u32> = Vec::new();
+    for &pid in pids {
+        if !unique.contains(&pid) {
+            unique.push(pid);
+        }
+    }
+
+    if unique.len() <= 1 {
+        return unique;
+    }
+
+    // Build a PID → parent PID map from a process snapshot
+    let parent_map = build_parent_map();
+    if parent_map.is_empty() {
+        return unique;
+    }
+
+    // For each PID, walk up its parent chain. If any ancestor is in `unique`, discard this PID.
+    let pid_set: std::collections::HashSet<u32> = unique.iter().copied().collect();
+    let mut result = Vec::new();
+
+    for &pid in &unique {
+        let mut has_ancestor_in_set = false;
+        let mut current = pid;
+        // Walk up parent chain (limit depth to prevent infinite loops from circular refs)
+        for _ in 0..64 {
+            match parent_map.get(&current) {
+                Some(&parent) if parent != 0 && parent != current => {
+                    if pid_set.contains(&parent) {
+                        has_ancestor_in_set = true;
+                        break;
+                    }
+                    current = parent;
+                }
+                _ => break,
+            }
+        }
+        if !has_ancestor_in_set {
+            result.push(pid);
+        }
+    }
+
+    result
+}
+
+/// Build a map of PID → parent PID from a process snapshot.
+fn build_parent_map() -> std::collections::HashMap<u32, u32> {
+    let mut map = std::collections::HashMap::new();
+
+    unsafe {
+        let snapshot = match CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) {
+            Ok(h) => h,
+            Err(_) => return map,
+        };
+
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+
+        if Process32FirstW(snapshot, &mut entry).is_ok() {
+            loop {
+                map.insert(entry.th32ProcessID, entry.th32ParentProcessID);
+                if Process32NextW(snapshot, &mut entry).is_err() {
+                    break;
+                }
+            }
+        }
+
+        let _ = CloseHandle(snapshot);
+    }
+
+    map
+}

@@ -39,6 +39,7 @@ use crate::host::wasapi::stream::{AudioClientFlow, StreamInner};
 use windows::core::Interface;
 use windows::core::GUID;
 use windows::Win32::Devices::Properties;
+use windows::Win32::Foundation;
 use windows::Win32::Foundation::PROPERTYKEY;
 use windows::Win32::Media::{Audio, KernelStreaming, Multimedia};
 use windows::Win32::System::Com::{StructuredStorage, STGM_READ};
@@ -177,12 +178,95 @@ impl DeviceTrait for Device {
         D: FnMut(&Data, &InputCallbackInfo) + Send + 'static,
         E: FnMut(StreamError) + Send + 'static,
     {
-        let stream_inner = self.build_input_stream_raw_inner(config, sample_format)?;
-        Ok(Stream::new_input(
-            stream_inner,
-            data_callback,
-            error_callback,
-        ))
+        let excluded_pids = resolve_excluded_pids(config);
+
+        if excluded_pids.len() >= 2 {
+            // Multi-PID audio subtraction path:
+            // Total (classic loopback) - Include_0 - Include_1 - ... = output
+            com::com_initialized();
+
+            let stream_flags_loopback = Audio::AUDCLNT_STREAMFLAGS_EVENTCALLBACK | Audio::AUDCLNT_STREAMFLAGS_LOOPBACK;
+            let stream_flags_process = Audio::AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
+
+            // Create Total capture (classic loopback on this render endpoint)
+            let total_audio_client = match self.build_audioclient() {
+                Ok(client) => client,
+                Err(ref e) if e.code() == Audio::AUDCLNT_E_DEVICE_INVALIDATED => {
+                    return Err(BuildStreamError::DeviceNotAvailable)
+                }
+                Err(e) => {
+                    let description = format!("{}", e);
+                    let err = BackendSpecificError { description };
+                    return Err(err.into());
+                }
+            };
+            let total = initialize_capture_client(total_audio_client, config, sample_format, stream_flags_loopback)?;
+
+            // Create Include captures for each excluded PID
+            let mut includes = Vec::new();
+            for &pid in &excluded_pids {
+                match activate_process_loopback_audio_client(pid, PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE) {
+                    Ok(include_client) => {
+                        match initialize_capture_client(include_client, config, sample_format, stream_flags_process) {
+                            Ok(components) => includes.push(components),
+                            Err(e) => {
+                                // Log but continue - some processes may not be capturable
+                                eprintln!("Warning: failed to initialize include capture for PID {}: {:?}", pid, e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: failed to activate include capture for PID {}: {:?}", pid, e);
+                    }
+                }
+            }
+
+            if includes.is_empty() {
+                // All include captures failed, fall back to classic loopback (pass through Total)
+                // We need to rebuild as a StreamInner for the Single path
+                // since the total's audio_client is already initialized
+                let client_flow = AudioClientFlow::Capture { capture_client: total.capture_client };
+                let audio_clock = unsafe {
+                    total.audio_client
+                        .GetService::<Audio::IAudioClock>()
+                        .map_err(|e| {
+                            let description = format!("failed to build audio clock: {}", e);
+                            let err = BackendSpecificError { description };
+                            BuildStreamError::from(err)
+                        })?
+                };
+                let stream_inner = StreamInner {
+                    audio_client: total.audio_client,
+                    audio_clock,
+                    client_flow,
+                    event: total.event,
+                    playing: false,
+                    max_frames_in_buffer: total.max_frames_in_buffer,
+                    bytes_per_frame: total.bytes_per_frame,
+                    config: config.clone(),
+                    sample_format,
+                };
+                return Ok(Stream::new_input(stream_inner, data_callback, error_callback));
+            }
+
+            let bytes_per_frame = total.bytes_per_frame;
+            Ok(Stream::new_multi_exclude(
+                total,
+                includes,
+                sample_format,
+                bytes_per_frame,
+                data_callback,
+                error_callback,
+            ))
+        } else {
+            // 0 or 1 PID: classic loopback or single-PID EXCLUDE
+            let stream_inner = self.build_input_stream_raw_inner(config, sample_format, &excluded_pids)?;
+            Ok(Stream::new_input(
+                stream_inner,
+                data_callback,
+                error_callback,
+            ))
+        }
     }
 
     fn build_output_stream_raw<D, E>(
@@ -501,18 +585,17 @@ impl Device {
         &self,
         config: &StreamConfig,
         sample_format: SampleFormat,
+        excluded_pids: &[u32],
     ) -> Result<StreamInner, BuildStreamError> {
         unsafe {
             com::com_initialized();
 
-            // Determine capture mode: per-process loopback or classic loopback
-            let excluded_pid = resolve_excluded_pid(config);
-
-            let audio_client = if let Some(pid) = excluded_pid {
-                // Per-process loopback path: uses ActivateAudioInterfaceAsync
-                activate_process_loopback_audio_client(pid)?
+            let audio_client = if excluded_pids.len() == 1 {
+                // Single PID: per-process loopback EXCLUDE path
+                let pid = excluded_pids[0];
+                activate_process_loopback_audio_client(pid, PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE)?
             } else {
-                // Classic loopback path: uses IMMDevice::Activate
+                // Classic loopback path (also used as Total for multi-PID subtraction)
                 match self.build_audioclient() {
                     Ok(client) => client,
                     Err(ref e) if e.code() == Audio::AUDCLNT_E_DEVICE_INVALIDATED => {
@@ -526,90 +609,21 @@ impl Device {
                 }
             };
 
-            let buffer_duration = buffer_size_to_duration(&config.buffer_size, config.sample_rate);
-
-            // Per-process loopback does NOT use AUDCLNT_STREAMFLAGS_LOOPBACK
+            // Per-process loopback (single PID) does NOT use AUDCLNT_STREAMFLAGS_LOOPBACK
             // (the loopback is set up at activation level).
-            // Classic loopback requires the LOOPBACK flag.
-            let stream_flags = if excluded_pid.is_some() {
+            // Classic loopback and multi-PID subtraction require the LOOPBACK flag on the Total capture.
+            let stream_flags = if excluded_pids.len() == 1 {
                 Audio::AUDCLNT_STREAMFLAGS_EVENTCALLBACK
             } else {
                 Audio::AUDCLNT_STREAMFLAGS_EVENTCALLBACK | Audio::AUDCLNT_STREAMFLAGS_LOOPBACK
             };
 
-            let waveformatex = {
-                let format_attempt = config_to_waveformatextensible(config, sample_format)
-                    .ok_or(BuildStreamError::StreamConfigNotSupported)?;
-                let share_mode = Audio::AUDCLNT_SHAREMODE_SHARED;
+            // Use the shared helper to initialize the capture client
+            let components = initialize_capture_client(audio_client, config, sample_format, stream_flags)?;
 
-                match crate::host::wasapi::device::is_format_supported(
-                    &audio_client,
-                    &format_attempt.Format,
-                ) {
-                    Ok(false) => return Err(BuildStreamError::StreamConfigNotSupported),
-                    Err(_) => return Err(BuildStreamError::DeviceNotAvailable),
-                    _ => (),
-                }
+            let client_flow = AudioClientFlow::Capture { capture_client: components.capture_client };
 
-                let hresult = audio_client.Initialize(
-                    share_mode,
-                    stream_flags,
-                    buffer_duration,
-                    0,
-                    &format_attempt.Format,
-                    None,
-                );
-                match hresult {
-                    Err(ref e) if e.code() == Audio::AUDCLNT_E_DEVICE_INVALIDATED => {
-                        return Err(BuildStreamError::DeviceNotAvailable);
-                    }
-                    Err(e) => {
-                        let description = format!("{}", e);
-                        let err = BackendSpecificError { description };
-                        return Err(err.into());
-                    }
-                    Ok(()) => (),
-                };
-
-                format_attempt.Format
-            };
-
-            let max_frames_in_buffer = audio_client
-                .GetBufferSize()
-                .map_err(|e| windows_err_to_cpal_err::<BuildStreamError>(e))?;
-
-            let event = {
-                use std::ptr;
-                use windows::Win32::System::Threading;
-
-                let event =
-                    Threading::CreateEventA(None, false, false, windows::core::PCSTR(ptr::null()))
-                        .map_err(|e| {
-                            let description = format!("failed to create event: {}", e);
-                            let err = BackendSpecificError { description };
-                            BuildStreamError::from(err)
-                        })?;
-
-                if let Err(e) = audio_client.SetEventHandle(event) {
-                    let description = format!("failed to call SetEventHandle: {}", e);
-                    let err = BackendSpecificError { description };
-                    return Err(err.into());
-                }
-
-                event
-            };
-
-            let capture_client = audio_client
-                .GetService::<Audio::IAudioCaptureClient>()
-                .map_err(|e| {
-                    let description = format!("failed to build capture client: {}", e);
-                    let err = BackendSpecificError { description };
-                    BuildStreamError::from(err)
-                })?;
-
-            let client_flow = AudioClientFlow::Capture { capture_client };
-
-            let audio_clock = audio_client
+            let audio_clock = components.audio_client
                 .GetService::<Audio::IAudioClock>()
                 .map_err(|e| {
                     let description = format!("failed to build audio clock: {}", e);
@@ -618,13 +632,13 @@ impl Device {
                 })?;
 
             Ok(StreamInner {
-                audio_client,
+                audio_client: components.audio_client,
                 audio_clock,
                 client_flow,
-                event,
+                event: components.event,
                 playing: false,
-                max_frames_in_buffer,
-                bytes_per_frame: waveformatex.nBlockAlign,
+                max_frames_in_buffer: components.max_frames_in_buffer,
+                bytes_per_frame: components.bytes_per_frame,
                 config: config.clone(),
                 sample_format,
             })
@@ -913,19 +927,142 @@ unsafe fn get_property_string(
 }
 
 // ============================================================================
+// Capture client initialization helpers
+// ============================================================================
+
+/// Components of an initialized capture client, ready for audio capture.
+///
+/// Used by both the classic loopback path and the multi-PID subtraction path
+/// to share the IAudioClient → capture client initialization logic.
+pub(crate) struct CaptureComponents {
+    pub audio_client: Audio::IAudioClient,
+    pub capture_client: Audio::IAudioCaptureClient,
+    pub event: Foundation::HANDLE,
+    pub max_frames_in_buffer: u32,
+    pub bytes_per_frame: u16,
+}
+
+// SAFETY: CaptureComponents contains Windows COM objects and HANDLE, which are safe to send
+// between threads. COM objects are reference-counted and HANDLE is a synchronization primitive.
+// This is the same reasoning used for wasapi::stream::Stream and wasapi_loopback::Stream.
+unsafe impl Send for CaptureComponents {}
+
+/// Initialize an `IAudioClient` for capture, setting up the event, format, and capture client.
+///
+/// The caller provides a pre-obtained `IAudioClient` (from either `IMMDevice::Activate` or
+/// `ActivateAudioInterfaceAsync`). This function handles:
+/// 1. Format negotiation and `Initialize()`
+/// 2. Event creation and `SetEventHandle()`
+/// 3. `GetService::<IAudioCaptureClient>()`
+///
+/// # Arguments
+/// * `audio_client` - A pre-obtained `IAudioClient`
+/// * `config` - Stream configuration (sample rate, channels, buffer size)
+/// * `sample_format` - The desired sample format
+/// * `stream_flags` - WASAPI stream flags (e.g., with/without LOOPBACK)
+pub(crate) fn initialize_capture_client(
+    audio_client: Audio::IAudioClient,
+    config: &StreamConfig,
+    sample_format: SampleFormat,
+    stream_flags: u32,
+) -> Result<CaptureComponents, BuildStreamError> {
+    unsafe {
+        let buffer_duration = buffer_size_to_duration(&config.buffer_size, config.sample_rate);
+
+        let waveformatex = {
+            let format_attempt = config_to_waveformatextensible(config, sample_format)
+                .ok_or(BuildStreamError::StreamConfigNotSupported)?;
+
+            match crate::host::wasapi::device::is_format_supported(
+                &audio_client,
+                &format_attempt.Format,
+            ) {
+                Ok(false) => return Err(BuildStreamError::StreamConfigNotSupported),
+                Err(_) => return Err(BuildStreamError::DeviceNotAvailable),
+                _ => (),
+            }
+
+            let hresult = audio_client.Initialize(
+                Audio::AUDCLNT_SHAREMODE_SHARED,
+                stream_flags,
+                buffer_duration,
+                0,
+                &format_attempt.Format,
+                None,
+            );
+            match hresult {
+                Err(ref e) if e.code() == Audio::AUDCLNT_E_DEVICE_INVALIDATED => {
+                    return Err(BuildStreamError::DeviceNotAvailable);
+                }
+                Err(e) => {
+                    let description = format!("{}", e);
+                    let err = BackendSpecificError { description };
+                    return Err(err.into());
+                }
+                Ok(()) => (),
+            };
+
+            format_attempt.Format
+        };
+
+        let max_frames_in_buffer = audio_client
+            .GetBufferSize()
+            .map_err(|e| windows_err_to_cpal_err::<BuildStreamError>(e))?;
+
+        let event = {
+            use std::ptr;
+            use windows::Win32::System::Threading;
+
+            let event =
+                Threading::CreateEventA(None, false, false, windows::core::PCSTR(ptr::null()))
+                    .map_err(|e| {
+                        let description = format!("failed to create event: {}", e);
+                        let err = BackendSpecificError { description };
+                        BuildStreamError::from(err)
+                    })?;
+
+            if let Err(e) = audio_client.SetEventHandle(event) {
+                let _ = Foundation::CloseHandle(event);
+                let description = format!("failed to call SetEventHandle: {}", e);
+                let err = BackendSpecificError { description };
+                return Err(err.into());
+            }
+
+            event
+        };
+
+        let capture_client = audio_client
+            .GetService::<Audio::IAudioCaptureClient>()
+            .map_err(|e| {
+                let _ = Foundation::CloseHandle(event);
+                let description = format!("failed to build capture client: {}", e);
+                let err = BackendSpecificError { description };
+                BuildStreamError::from(err)
+            })?;
+
+        Ok(CaptureComponents {
+            audio_client,
+            capture_client,
+            event,
+            max_frames_in_buffer,
+            bytes_per_frame: waveformatex.nBlockAlign,
+        })
+    }
+}
+
+// ============================================================================
 // Per-process loopback activation (Windows 10 2004+)
 // ============================================================================
 
 // Manual definitions for process loopback types not yet in the `windows` crate.
 
 /// The virtual audio device path for process loopback activation.
-const VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK: &str = "VAD\\Process\\Loopback";
+const VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK: &str = "VAD\\Process_Loopback";
 
 /// Activation type for process loopback.
-const AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK: u32 = 0;
+const AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK: u32 = 1;
 
 /// Include only the target process's audio.
-#[allow(dead_code)]
 const PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE: u32 = 0;
 
 /// Exclude the target process's audio (capture everything else).
@@ -984,11 +1121,18 @@ impl Audio::IActivateAudioInterfaceCompletionHandler_Impl for ActivationCompleti
 /// Activate an `IAudioClient` for per-process loopback capture.
 ///
 /// Uses `ActivateAudioInterfaceAsync` with `AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK`
-/// to get an audio client that captures all system audio EXCEPT the target process's audio.
+/// to get an audio client that captures audio relative to the target process.
+///
+/// # Arguments
+/// * `target_pid` - The process ID to target
+/// * `process_loopback_mode` - Use `PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE` to capture
+///   everything except the target process, or `PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE`
+///   to capture only the target process's audio.
 ///
 /// Requires Windows 10 version 2004 (build 19041) or later.
 fn activate_process_loopback_audio_client(
     target_pid: u32,
+    process_loopback_mode: u32,
 ) -> Result<Audio::IAudioClient, BuildStreamError> {
     use std::sync::mpsc;
 
@@ -999,7 +1143,7 @@ fn activate_process_loopback_audio_client(
         activation_type: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
         process_loopback_params: AudioClientProcessLoopbackParams {
             target_process_id: target_pid,
-            process_loopback_mode: PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
+            process_loopback_mode,
         },
     };
 
@@ -1067,29 +1211,33 @@ fn activate_process_loopback_audio_client(
     Ok(audio_client)
 }
 
-/// Resolve excluded app names/PIDs from a `StreamConfig` into a single target PID.
+/// Resolve excluded app names/PIDs from a `StreamConfig` into target PIDs.
 ///
-/// Returns `Some(pid)` if per-process loopback should be used, `None` for classic loopback.
-/// Windows per-process loopback only supports a single PID at a time.
-fn resolve_excluded_pid(config: &StreamConfig) -> Option<u32> {
+/// Returns a list of PIDs to exclude. The caller decides the capture strategy:
+/// - 0 PIDs → classic loopback (capture all system audio)
+/// - 1 PID → per-process EXCLUDE loopback (single API call)
+/// - 2+ PIDs → audio subtraction (Total - INCLUDE_A - INCLUDE_B - ...)
+fn resolve_excluded_pids(config: &StreamConfig) -> Vec<u32> {
     // Check explicit PIDs first
     if let Some(ref pids) = config.excluded_app_pids {
-        if let Some(&first_pid) = pids.first() {
-            return Some(first_pid as u32);
+        if !pids.is_empty() {
+            let raw: Vec<u32> = pids.iter().map(|&p| p as u32).collect();
+            return process::deduplicate_pids_by_tree(&raw);
         }
     }
 
     // Resolve app names to PIDs
     if let Some(ref names) = config.excluded_app_names {
         if !names.is_empty() {
-            let procs = process::find_pids_by_name_substrings(names);
-            if let Some(first) = procs.first() {
-                return Some(first.pid);
-            }
+            let raw: Vec<u32> = process::find_pids_by_name_substrings(names)
+                .into_iter()
+                .map(|p| p.pid)
+                .collect();
+            return process::deduplicate_pids_by_tree(&raw);
         }
     }
 
-    None
+    Vec::new()
 }
 
 // ============================================================================
