@@ -155,6 +155,10 @@ impl Drop for CaptureSource {
 /// rendering silence, we keep the engine active and ensure loopback capture produces
 /// zero-valued samples even when no real audio is playing — matching macOS
 /// ScreenCaptureKit's always-on behavior.
+/// Note: No Drop impl because `run_silence_render` moves fields out individually.
+/// The event HANDLE is closed explicitly in `run_silence_render` on all exit paths
+/// (normal exit and Start() failure). A panic during setup would leak the HANDLE,
+/// but panics in unsafe Win32 code are already UB-adjacent.
 pub(crate) struct SilenceRenderComponents {
     pub audio_client: Audio::IAudioClient,
     pub render_client: Audio::IAudioRenderClient,
