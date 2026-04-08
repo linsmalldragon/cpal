@@ -29,9 +29,9 @@ pub use wasapi_stream::StreamInner;
 /// - `MultiExclude`: Custom capture thread that performs audio subtraction for multi-PID exclusion.
 pub enum Stream {
     /// Classic loopback or single-PID EXCLUDE (delegates to wasapi stream)
-    Single(wasapi_stream::Stream),
+    Single(wasapi_stream::Stream, Option<SilenceStream>),
     /// Audio subtraction: Total - Include_0 - Include_1 - ... for 2+ excluded PIDs
-    MultiExclude(MultiExcludeStream),
+    MultiExclude(MultiExcludeStream, Option<SilenceStream>),
 }
 
 unsafe impl Send for Stream {}
@@ -46,6 +46,7 @@ impl Stream {
         stream_inner: StreamInner,
         data_callback: D,
         error_callback: E,
+        silence: Option<SilenceStream>,
     ) -> Stream
     where
         D: FnMut(&Data, &InputCallbackInfo) + Send + 'static,
@@ -55,7 +56,7 @@ impl Stream {
             stream_inner,
             data_callback,
             error_callback,
-        ))
+        ), silence)
     }
 
     /// Create a multi-exclude stream for audio subtraction
@@ -66,6 +67,7 @@ impl Stream {
         bytes_per_frame: u16,
         data_callback: D,
         error_callback: E,
+        silence: Option<SilenceStream>,
     ) -> Stream
     where
         D: FnMut(&Data, &InputCallbackInfo) + Send + 'static,
@@ -78,22 +80,22 @@ impl Stream {
             bytes_per_frame,
             data_callback,
             error_callback,
-        ))
+        ), silence)
     }
 }
 
 impl StreamTrait for Stream {
     fn play(&self) -> Result<(), PlayStreamError> {
         match self {
-            Stream::Single(s) => s.play(),
-            Stream::MultiExclude(s) => s.play(),
+            Stream::Single(s, _) => s.play(),
+            Stream::MultiExclude(s, _) => s.play(),
         }
     }
 
     fn pause(&self) -> Result<(), PauseStreamError> {
         match self {
-            Stream::Single(s) => s.pause(),
-            Stream::MultiExclude(s) => s.pause(),
+            Stream::Single(s, _) => s.pause(),
+            Stream::MultiExclude(s, _) => s.pause(),
         }
     }
 }
@@ -139,6 +141,155 @@ impl Drop for CaptureSource {
         unsafe {
             let _ = Foundation::CloseHandle(self.event);
         }
+    }
+}
+
+// ============================================================================
+// Silence render stream (keeps WASAPI audio engine active for loopback)
+// ============================================================================
+
+/// Components needed to render silence on a WASAPI endpoint.
+///
+/// WASAPI loopback capture only produces samples when the audio engine is active
+/// (i.e., at least one application is rendering audio to the endpoint). By continuously
+/// rendering silence, we keep the engine active and ensure loopback capture produces
+/// zero-valued samples even when no real audio is playing — matching macOS
+/// ScreenCaptureKit's always-on behavior.
+pub(crate) struct SilenceRenderComponents {
+    pub audio_client: Audio::IAudioClient,
+    pub render_client: Audio::IAudioRenderClient,
+    pub event: Foundation::HANDLE,
+    pub buffer_frames: u32,
+}
+
+// SAFETY: COM objects are reference-counted and HANDLE is a synchronization primitive.
+// The components are moved into a dedicated thread and accessed exclusively from there.
+unsafe impl Send for SilenceRenderComponents {}
+
+/// A background thread that renders silence to keep the WASAPI audio engine active.
+///
+/// Created alongside loopback capture streams. Starts rendering immediately on
+/// construction and stops on drop.
+pub(crate) struct SilenceStream {
+    thread: Option<JoinHandle<()>>,
+    stop_event: Foundation::HANDLE,
+}
+
+/// Thread context for the silence render thread.
+/// Groups HANDLE and components so the closure is `Send`.
+struct SilenceRenderContext {
+    components: SilenceRenderComponents,
+    stop_event: Foundation::HANDLE,
+}
+
+// SAFETY: HANDLE is a Windows synchronization primitive that is safe to send between threads.
+// The context is moved into the thread and used exclusively from there.
+unsafe impl Send for SilenceRenderContext {}
+
+impl SilenceStream {
+    pub(crate) fn new(components: SilenceRenderComponents) -> Self {
+        // Manual-reset event so it stays signaled once set
+        let stop_event = unsafe {
+            Threading::CreateEventA(None, true, false, windows::core::PCSTR(ptr::null()))
+        }
+        .expect("cpal: could not create silence stop event");
+
+        let ctx = SilenceRenderContext {
+            components,
+            stop_event,
+        };
+
+        let thread = thread::Builder::new()
+            .name("cpal_wasapi_silence".to_owned())
+            .spawn(move || {
+                run_silence_render(ctx);
+            })
+            .unwrap();
+
+        SilenceStream {
+            thread: Some(thread),
+            stop_event,
+        }
+    }
+}
+
+impl Drop for SilenceStream {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = Threading::SetEvent(self.stop_event);
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        unsafe {
+            let _ = Foundation::CloseHandle(self.stop_event);
+        }
+    }
+}
+
+/// Silence render thread main loop.
+///
+/// Renders silence via `AUDCLNT_BUFFERFLAGS_SILENT` (no actual data written,
+/// near-zero CPU overhead). Runs until `stop_event` is signaled.
+fn run_silence_render(ctx: SilenceRenderContext) {
+    use crate::host::wasapi::com;
+    com::com_initialized();
+
+    let audio_client = ctx.components.audio_client;
+    let render_client = ctx.components.render_client;
+    let buffer_event = ctx.components.event;
+    let buffer_frames = ctx.components.buffer_frames;
+    let stop_event = ctx.stop_event;
+
+    // Start rendering silence immediately
+    unsafe {
+        if let Err(e) = audio_client.Start() {
+            eprintln!("cpal: silence render stream failed to start: {}", e);
+            let _ = Foundation::CloseHandle(buffer_event);
+            return;
+        }
+    }
+
+    let handles = [stop_event, buffer_event];
+
+    loop {
+        let result = unsafe { Threading::WaitForMultipleObjectsEx(&handles, false, 2000, false) };
+
+        if result == Foundation::WAIT_OBJECT_0 {
+            // Stop event signaled
+            break;
+        }
+
+        let buffer_signaled = result.0 == Foundation::WAIT_OBJECT_0.0 + 1;
+        let timeout = result == Foundation::WAIT_TIMEOUT;
+
+        if buffer_signaled || timeout {
+            unsafe {
+                let padding = match audio_client.GetCurrentPadding() {
+                    Ok(p) => p,
+                    Err(_) => break, // Device disconnected
+                };
+                let available = buffer_frames.saturating_sub(padding);
+                if available > 0 {
+                    match render_client.GetBuffer(available) {
+                        Ok(_) => {
+                            // AUDCLNT_BUFFERFLAGS_SILENT tells the engine to treat the
+                            // buffer as silence without us writing any data
+                            let _ = render_client
+                                .ReleaseBuffer(available, AUDCLNT_BUFFERFLAGS_SILENT);
+                        }
+                        Err(_) => break, // Device disconnected
+                    }
+                }
+            }
+        } else if result == Foundation::WAIT_FAILED {
+            break;
+        }
+    }
+
+    unsafe {
+        let _ = audio_client.Stop();
+        let _ = Foundation::CloseHandle(buffer_event);
     }
 }
 

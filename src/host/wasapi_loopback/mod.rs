@@ -180,6 +180,23 @@ impl DeviceTrait for Device {
     {
         let excluded_pids = resolve_excluded_pids(config);
 
+        // Create a silence render stream to keep the WASAPI audio engine active.
+        // Without this, loopback capture only produces samples when real audio is
+        // playing, causing long delays in the audio pipeline. The silence stream
+        // ensures continuous sample delivery (zeros when silent), matching macOS
+        // ScreenCaptureKit behavior.
+        let silence = match create_silence_render_components(&self.device) {
+            Ok(components) => Some(stream::SilenceStream::new(components)),
+            Err(e) => {
+                eprintln!(
+                    "cpal: failed to create silence render stream \
+                     (loopback will only produce samples when audio is playing): {:?}",
+                    e
+                );
+                None
+            }
+        };
+
         if excluded_pids.len() >= 2 {
             // Multi-PID audio subtraction path:
             // Total (classic loopback) - Include_0 - Include_1 - ... = output
@@ -246,7 +263,7 @@ impl DeviceTrait for Device {
                     config: config.clone(),
                     sample_format,
                 };
-                return Ok(Stream::new_input(stream_inner, data_callback, error_callback));
+                return Ok(Stream::new_input(stream_inner, data_callback, error_callback, silence));
             }
 
             let bytes_per_frame = total.bytes_per_frame;
@@ -257,6 +274,7 @@ impl DeviceTrait for Device {
                 bytes_per_frame,
                 data_callback,
                 error_callback,
+                silence,
             ))
         } else {
             // 0 or 1 PID: classic loopback or single-PID EXCLUDE
@@ -265,6 +283,7 @@ impl DeviceTrait for Device {
                 stream_inner,
                 data_callback,
                 error_callback,
+                silence,
             ))
         }
     }
@@ -1046,6 +1065,94 @@ pub(crate) fn initialize_capture_client(
             event,
             max_frames_in_buffer,
             bytes_per_frame: waveformatex.nBlockAlign,
+        })
+    }
+}
+
+// ============================================================================
+// Silence render stream (keeps WASAPI audio engine active for loopback)
+// ============================================================================
+
+/// Create render components for a silence stream on the given endpoint.
+///
+/// WASAPI loopback capture only produces sample callbacks when the audio engine
+/// is active (i.e., at least one application is rendering audio to the endpoint).
+/// By creating a render client that continuously outputs silence, we keep the
+/// engine active and ensure the loopback capture delivers zero-valued samples
+/// even when no real audio is playing — matching macOS ScreenCaptureKit behavior.
+///
+/// The silence is rendered using `AUDCLNT_BUFFERFLAGS_SILENT`, which tells the
+/// engine to treat the buffer as silence without writing actual data. This has
+/// near-zero CPU overhead.
+fn create_silence_render_components(
+    device: &Audio::IMMDevice,
+) -> Result<stream::SilenceRenderComponents, BuildStreamError> {
+    unsafe {
+        com::com_initialized();
+
+        // Create a separate IAudioClient for rendering (independent from the capture client)
+        let audio_client: Audio::IAudioClient = device
+            .Activate(windows::Win32::System::Com::CLSCTX_ALL, None)
+            .map_err(|e| {
+                let description = format!("failed to activate render client for silence stream: {}", e);
+                BuildStreamError::from(BackendSpecificError { description })
+            })?;
+
+        // Get the device's mix format
+        let format_ptr = audio_client.GetMixFormat().map_err(|e| {
+            let description = format!("failed to get mix format for silence stream: {}", e);
+            BuildStreamError::from(BackendSpecificError { description })
+        })?;
+        // Wrap in RAII so CoTaskMemFree is called on all exit paths
+        let _format_guard = WaveFormatExPtr(format_ptr);
+
+        // Initialize as shared-mode render stream with event-driven buffer notifications
+        let hresult = audio_client.Initialize(
+            Audio::AUDCLNT_SHAREMODE_SHARED,
+            Audio::AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+            0, // default buffer duration
+            0,
+            format_ptr,
+            None,
+        );
+        if let Err(e) = hresult {
+            let description = format!("failed to initialize silence render client: {}", e);
+            return Err(BuildStreamError::from(BackendSpecificError { description }));
+        }
+
+        let buffer_frames = audio_client.GetBufferSize().map_err(|e| {
+            let description = format!("failed to get buffer size for silence stream: {}", e);
+            BuildStreamError::from(BackendSpecificError { description })
+        })?;
+
+        // Create event for buffer-ready notifications
+        use windows::Win32::System::Threading;
+        let event = Threading::CreateEventA(None, false, false, windows::core::PCSTR(std::ptr::null()))
+            .map_err(|e| {
+                let description = format!("failed to create event for silence stream: {}", e);
+                BuildStreamError::from(BackendSpecificError { description })
+            })?;
+
+        if let Err(e) = audio_client.SetEventHandle(event) {
+            let _ = Foundation::CloseHandle(event);
+            let description = format!("failed to set event handle for silence stream: {}", e);
+            return Err(BuildStreamError::from(BackendSpecificError { description }));
+        }
+
+        // Get the render client (for writing silence buffers)
+        let render_client = audio_client
+            .GetService::<Audio::IAudioRenderClient>()
+            .map_err(|e| {
+                let _ = Foundation::CloseHandle(event);
+                let description = format!("failed to get render client for silence stream: {}", e);
+                BuildStreamError::from(BackendSpecificError { description })
+            })?;
+
+        Ok(stream::SilenceRenderComponents {
+            audio_client,
+            render_client,
+            event,
+            buffer_frames,
         })
     }
 }
