@@ -393,16 +393,23 @@ impl Device {
             );
 
             // Build a descriptive name that includes the output device info
-            let base_name = device_desc_str
-                .or(friendly_name.clone())
-                .ok_or_else(|| DeviceNameError::BackendSpecific {
+            // 优先使用 friendly_name（如 "Speakers (Realtek(R) Audio)"），它已包含驱动信息，
+            // 比 device_desc + form_factor（"Speakers (Speakers)"）更具辨识度且不会重复。
+            let form_factor_name = form_factor.map(form_factor_to_name).unwrap_or("Audio Output");
+            let name = if let Some(ref fname) = friendly_name {
+                fname.clone()
+            } else {
+                let desc = device_desc_str.ok_or_else(|| DeviceNameError::BackendSpecific {
                     err: BackendSpecificError {
                         description: "failed to retrieve device name".to_string(),
                     },
                 })?;
-
-            let form_factor_name = form_factor.map(form_factor_to_name).unwrap_or("Audio Output");
-            let name = format!("{} ({})", base_name, form_factor_name);
+                if desc.eq_ignore_ascii_case(form_factor_name) {
+                    desc
+                } else {
+                    format!("{} ({})", desc, form_factor_name)
+                }
+            };
 
             // Determine interface_type
             let mut interface_type = None;
