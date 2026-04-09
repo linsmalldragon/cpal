@@ -43,18 +43,12 @@ use windows::Win32::Foundation;
 use windows::Win32::Foundation::PROPERTYKEY;
 use windows::Win32::Media::{Audio, KernelStreaming, Multimedia};
 use windows::Win32::System::Com::{StructuredStorage, STGM_READ};
-use windows::Win32::System::Variant::{VT_BLOB, VT_LPWSTR, VT_UI4};
+use windows::Win32::System::Variant::{VT_BLOB, VT_LPWSTR};
 use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
 
 mod enumerate;
 mod process;
 mod stream;
-
-/// PKEY_AudioEndpoint_FormFactor (PID 0)
-const PKEY_AUDIOENDPOINT_FORMFACTOR: PROPERTYKEY = PROPERTYKEY {
-    fmtid: GUID::from_u128(0x1da5d803_d492_4edd_8c23_e0c0ffee7f0e),
-    pid: 0,
-};
 
 /// PKEY_AudioEndpoint_JackSubType (PID 8)
 const PKEY_AUDIOENDPOINT_JACKSUBTYPE: PROPERTYKEY = PROPERTYKEY {
@@ -308,18 +302,32 @@ impl DeviceTrait for Device {
 // Device implementation
 // ============================================================================
 
-/// Maps WASAPI FormFactor to a user-facing device type name for display.
-/// Unlike the regular WASAPI backend, loopback devices always report as SystemAudioCapture.
-fn form_factor_to_name(form_factor: u32) -> &'static str {
-    match form_factor {
-        0 => "Network Audio",   // RemoteNetworkDevice
-        1 => "Speakers",        // Speakers
-        2 => "Line Out",        // LineLevel
-        3 => "Headphones",      // Headphones
-        5 => "Headset",         // Headset
-        8 => "S/PDIF",          // SPDIF
-        9 => "HDMI Audio",      // DigitalAudioDisplayDevice
-        _ => "Audio Output",
+/// Get the computer's hostname for use in device display names.
+/// Returns something like "DESKTOP-ABC123" or a custom computer name.
+/// Falls back to "PC" if the API call fails.
+///
+/// This mirrors the macOS ScreenCaptureKit approach where loopback devices
+/// are named "{hostname} Audio" instead of using driver/hardware names.
+fn get_computer_name() -> String {
+    use windows::Win32::System::SystemInformation::{ComputerNameDnsHostname, GetComputerNameExW};
+    unsafe {
+        let mut size: u32 = 0;
+        // First call to get required buffer size (expected to fail with ERROR_MORE_DATA)
+        let _ = GetComputerNameExW(ComputerNameDnsHostname, None, &mut size);
+        if size == 0 {
+            return "PC".to_string();
+        }
+        let mut buffer = vec![0u16; size as usize];
+        let result = GetComputerNameExW(
+            ComputerNameDnsHostname,
+            Some(windows::core::PWSTR(buffer.as_mut_ptr())),
+            &mut size,
+        );
+        if result.is_ok() {
+            String::from_utf16_lossy(&buffer[..size as usize])
+        } else {
+            "PC".to_string()
+        }
     }
 }
 
@@ -367,11 +375,6 @@ impl Device {
                 &Properties::DEVPKEY_Device_FriendlyName as *const _ as *const _,
             );
 
-            let device_desc_str = get_property_string(
-                &property_store,
-                &Properties::DEVPKEY_Device_DeviceDesc as *const _ as *const _,
-            );
-
             let interface_name = get_property_string(
                 &property_store,
                 &Properties::DEVPKEY_DeviceInterface_FriendlyName as *const _ as *const _,
@@ -382,34 +385,16 @@ impl Device {
                 &Properties::DEVPKEY_Device_EnumeratorName as *const _ as *const _,
             );
 
-            let form_factor = get_property_u32(
-                &property_store,
-                &PKEY_AUDIOENDPOINT_FORMFACTOR as *const _ as *const _,
-            );
-
             let jack_subtype = get_property_string(
                 &property_store,
                 &PKEY_AUDIOENDPOINT_JACKSUBTYPE as *const _ as *const _,
             );
 
-            // Build a descriptive name that includes the output device info
-            // 优先使用 friendly_name（如 "Speakers (Realtek(R) Audio)"），它已包含驱动信息，
-            // 比 device_desc + form_factor（"Speakers (Speakers)"）更具辨识度且不会重复。
-            let form_factor_name = form_factor.map(form_factor_to_name).unwrap_or("Audio Output");
-            let name = if let Some(ref fname) = friendly_name {
-                fname.clone()
-            } else {
-                let desc = device_desc_str.ok_or_else(|| DeviceNameError::BackendSpecific {
-                    err: BackendSpecificError {
-                        description: "failed to retrieve device name".to_string(),
-                    },
-                })?;
-                if desc.eq_ignore_ascii_case(form_factor_name) {
-                    desc
-                } else {
-                    format!("{} ({})", desc, form_factor_name)
-                }
-            };
+            // Build a descriptive name using computer hostname (matching macOS ScreenCaptureKit style)
+            // macOS: "{hostname} Audio"  (e.g., "xiaodragonmacbook Audio")
+            // Windows: "{hostname} Audio" (e.g., "DESKTOP-ABC123 Audio")
+            let computer_name = get_computer_name();
+            let name = format!("{} Audio", computer_name);
 
             // Determine interface_type
             let mut interface_type = None;
@@ -895,23 +880,6 @@ fn buffer_size_to_duration(buffer_size: &crate::BufferSize, sample_rate: u32) ->
 
 fn buffer_duration_to_frames(duration: i64, sample_rate: u32) -> crate::FrameCount {
     ((duration as f64 / 10_000_000.0) * sample_rate as f64) as crate::FrameCount
-}
-
-// Helper function to query a DWORD property from a WASAPI device property store
-unsafe fn get_property_u32(
-    property_store: &IPropertyStore,
-    property_key: *const PROPERTYKEY,
-) -> Option<u32> {
-    let mut property_value = property_store.GetValue(property_key).ok()?;
-    let prop_variant = &property_value.Anonymous.Anonymous;
-
-    if prop_variant.vt != VT_UI4 {
-        return None;
-    }
-
-    let value = *(&prop_variant.Anonymous as *const _ as *const u32);
-    StructuredStorage::PropVariantClear(&mut property_value).ok();
-    Some(value)
 }
 
 // Helper function to query a string property from a WASAPI device property store
