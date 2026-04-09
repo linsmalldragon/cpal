@@ -179,15 +179,28 @@ impl DeviceTrait for Device {
         // playing, causing long delays in the audio pipeline. The silence stream
         // ensures continuous sample delivery (zeros when silent), matching macOS
         // ScreenCaptureKit behavior.
-        let silence = match create_silence_render_components(&self.device) {
-            Ok(components) => Some(stream::SilenceStream::new(components)),
-            Err(e) => {
-                eprintln!(
-                    "cpal: failed to create silence render stream \
-                     (loopback will only produce samples when audio is playing): {:?}",
-                    e
-                );
-                None
+        //
+        // EXCEPTION: Skip for Bluetooth endpoints. The additional render client
+        // (IAudioClient in shared render mode) on a BT A2DP endpoint can trigger
+        // codec renegotiation or quality degradation. When using BT headphones,
+        // the user is actively playing audio, so the audio engine is already active.
+        let silence = if self.is_bluetooth() {
+            eprintln!(
+                "cpal: skipping silence render stream for Bluetooth endpoint \
+                 (loopback will only produce samples when audio is playing)"
+            );
+            None
+        } else {
+            match create_silence_render_components(&self.device) {
+                Ok(components) => Some(stream::SilenceStream::new(components)),
+                Err(e) => {
+                    eprintln!(
+                        "cpal: failed to create silence render stream \
+                         (loopback will only produce samples when audio is playing): {:?}",
+                        e
+                    );
+                    None
+                }
             }
         };
 
@@ -450,6 +463,24 @@ impl Device {
                 },
                 Err(e) => Err(DeviceIdError::BackendSpecific { err: e.into() }),
             }
+        }
+    }
+
+    /// Check if this device is connected via Bluetooth.
+    /// Used to skip the silence render stream for BT endpoints,
+    /// as the additional render client can degrade BT audio quality
+    /// (e.g., triggering A2DP → HFP codec switch or parameter renegotiation).
+    fn is_bluetooth(&self) -> bool {
+        unsafe {
+            let property_store = match self.device.OpenPropertyStore(STGM_READ) {
+                Ok(store) => store,
+                Err(_) => return false,
+            };
+            let enumerator_name = get_property_string(
+                &property_store,
+                &Properties::DEVPKEY_Device_EnumeratorName as *const _ as *const _,
+            );
+            matches!(enumerator_name.as_deref(), Some(name) if name.eq_ignore_ascii_case("BTHENUM"))
         }
     }
 
