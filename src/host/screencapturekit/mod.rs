@@ -544,6 +544,32 @@ impl Stream {
         self.update_content_filter_internal(display_id, &excluded_apps_refs)
     }
 
+    /// Update excluded applications by both name substrings and bundle identifiers in a single
+    /// filter update (without interrupting capture)
+    ///
+    /// This resolves apps from both names and bundle IDs, merges them, and applies a single
+    /// SCContentFilter update. This avoids the problem where calling `update_excluded_apps_by_names`
+    /// and `update_excluded_apps_by_bundle_ids` separately would cause the second call to replace
+    /// the first.
+    pub fn update_excluded_apps(&self, names: &[&str], bundle_ids: &[&str]) -> Result<(), UpdateFilterError> {
+        let stream = self.inner.borrow();
+        let display_id = stream.display_id;
+
+        let mut excluded_apps: Vec<Retained<SCRunningApplication>> = Vec::new();
+
+        if !names.is_empty() {
+            let names_vec: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+            excluded_apps.extend(enumerate::find_apps_by_name_substrings(&names_vec));
+        }
+
+        if !bundle_ids.is_empty() {
+            let bundle_ids_vec: Vec<String> = bundle_ids.iter().map(|s| s.to_string()).collect();
+            excluded_apps.extend(enumerate::find_apps_by_bundle_ids(&bundle_ids_vec));
+        }
+
+        self.update_content_filter_internal(display_id, &excluded_apps)
+    }
+
     /// Internal method to update the content filter
     fn update_content_filter_internal(
         &self,

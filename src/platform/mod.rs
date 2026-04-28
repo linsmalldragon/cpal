@@ -937,6 +937,31 @@ mod platform_impl {
             }
         }
 
+        /// Update excluded applications by both name substrings and bundle identifiers in a single
+        /// filter update (without interrupting capture)
+        ///
+        /// This resolves apps from both names and bundle IDs, merges them, and applies a single
+        /// SCContentFilter update. Use this instead of calling `update_excluded_apps_by_names` and
+        /// `update_excluded_apps_by_bundle_ids` separately, which would cause the second call to
+        /// replace the first.
+        ///
+        /// # Example
+        /// ```ignore
+        /// stream.update_excluded_apps(&["QQ音乐"], &["com.netease.163music"])?;
+        /// ```
+        pub fn update_excluded_apps(
+            &self,
+            names: &[&str],
+            bundle_ids: &[&str],
+        ) -> Result<(), UpdateFilterError> {
+            match &self.0 {
+                StreamInner::ScreenCaptureKit(s) => s.update_excluded_apps(names, bundle_ids),
+                _ => Err(UpdateFilterError {
+                    description: "update_excluded_apps is only supported for ScreenCaptureKit streams".to_string(),
+                }),
+            }
+        }
+
         /// Check if this stream is a ScreenCaptureKit stream
         ///
         /// Returns `true` if this stream was created from a ScreenCaptureKit device.
