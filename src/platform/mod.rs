@@ -971,12 +971,13 @@ mod platform_impl {
 
         /// Check if excluded apps have launched and auto-refresh the content filter.
         ///
-        /// Call this periodically from a polling loop. Returns `Ok(())` immediately
-        /// if no refresh is needed. For non-SCK streams, always returns `Ok(())`.
-        pub fn auto_refresh_exclusions(&self) -> Result<(), UpdateFilterError> {
+        /// Call this periodically from a polling loop. Returns `Ok(true)` if the filter
+        /// was refreshed, `Ok(false)` if no refresh was needed. For non-SCK streams,
+        /// always returns `Ok(false)`.
+        pub fn auto_refresh_exclusions(&self) -> Result<bool, UpdateFilterError> {
             match &self.0 {
                 StreamInner::ScreenCaptureKit(s) => s.auto_refresh_exclusions(),
-                _ => Ok(()),
+                _ => Ok(false),
             }
         }
 

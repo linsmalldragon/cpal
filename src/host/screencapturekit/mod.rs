@@ -417,13 +417,15 @@ impl Device {
         let exclusion_refresh_needed = Arc::new(AtomicBool::new(false));
 
         // Register NSWorkspace observer to detect when excluded apps launch
-        if !excluded_names.is_empty() || !excluded_bundle_ids.is_empty() {
-            register_app_launch_observer(
+        let app_launch_observer = if !excluded_names.is_empty() || !excluded_bundle_ids.is_empty() {
+            Some(register_app_launch_observer(
                 excluded_names.clone(),
                 excluded_bundle_ids.clone(),
                 exclusion_refresh_needed.clone(),
-            );
-        }
+            ))
+        } else {
+            None
+        };
 
         Ok(Stream::new(
             StreamInner {
@@ -434,6 +436,7 @@ impl Device {
                 stream_stopped,
                 excluded_app_names: excluded_names,
                 excluded_app_bundle_ids: excluded_bundle_ids,
+                app_launch_observer,
             },
             exclusion_refresh_needed,
         ))
@@ -467,6 +470,26 @@ struct StreamInner {
     // Exclusion config for auto-refresh when excluded apps launch after stream creation
     excluded_app_names: Vec<String>,
     excluded_app_bundle_ids: Vec<String>,
+    // NSWorkspace observer handle for cleanup on drop (Drop impl on AppLaunchObserver removes the observer)
+    #[allow(dead_code)]
+    app_launch_observer: Option<AppLaunchObserver>,
+}
+
+/// Holds the NSNotificationCenter + observer token so we can removeObserver: on Drop
+struct AppLaunchObserver {
+    center: *mut objc2::runtime::AnyObject,
+    observer: *mut objc2::runtime::AnyObject,
+}
+
+unsafe impl Send for AppLaunchObserver {}
+unsafe impl Sync for AppLaunchObserver {}
+
+impl Drop for AppLaunchObserver {
+    fn drop(&mut self) {
+        unsafe {
+            let _: () = msg_send![self.center, removeObserver: self.observer];
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -681,10 +704,10 @@ impl Stream {
     ///
     /// An NSWorkspace observer sets the internal flag when a matching app launches.
     /// Call this periodically from a polling loop to apply the updated exclusions.
-    /// Returns `Ok(())` immediately if no refresh is needed.
-    pub fn auto_refresh_exclusions(&self) -> Result<(), UpdateFilterError> {
+    /// Returns `Ok(true)` if the filter was refreshed, `Ok(false)` if no refresh was needed.
+    pub fn auto_refresh_exclusions(&self) -> Result<bool, UpdateFilterError> {
         if !self.exclusion_refresh_needed.swap(false, Ordering::Acquire) {
-            return Ok(());
+            return Ok(false);
         }
 
         // Invalidate app cache to pick up newly launched processes
@@ -697,7 +720,7 @@ impl Stream {
         drop(stream);
 
         if names.is_empty() && bundle_ids.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
 
         let mut excluded_apps: Vec<Retained<SCRunningApplication>> = Vec::new();
@@ -708,7 +731,8 @@ impl Stream {
             excluded_apps.extend(enumerate::find_apps_by_bundle_ids(&bundle_ids));
         }
 
-        self.update_content_filter_internal(display_id, &excluded_apps)
+        self.update_content_filter_internal(display_id, &excluded_apps)?;
+        Ok(true)
     }
 
     /// Check if the stream has been stopped by the system (e.g., display disconnected)
@@ -722,13 +746,13 @@ impl Stream {
 
 /// Register an NSWorkspace observer that sets the flag when a matching excluded app launches.
 ///
-/// Uses `NSWorkspaceDidLaunchApplicationNotification`. The observer is leaked via
-/// `std::mem::forget` to keep it alive for the stream's lifetime (same pattern as screen_lock.rs).
+/// Uses `NSWorkspaceDidLaunchApplicationNotification`. Returns an `AppLaunchObserver` that
+/// removes the observer on Drop, preventing observer accumulation across stream recreations.
 fn register_app_launch_observer(
     excluded_names: Vec<String>,
     excluded_bundle_ids: Vec<String>,
     flag: Arc<AtomicBool>,
-) {
+) -> AppLaunchObserver {
     use objc2::runtime::AnyObject;
     use objc2_foundation::NSNotificationName;
     use std::ptr::NonNull;
@@ -761,9 +785,9 @@ fn register_app_launch_observer(
             queue: std::ptr::null::<AnyObject>(),
             usingBlock: &*block
         ];
-        // Leak observer + block to keep them alive
-        std::mem::forget(block);
-        let _ = observer;
+        // ObjC copies the block internally, so RcBlock can drop safely here
+
+        AppLaunchObserver { center, observer }
     }
 }
 
