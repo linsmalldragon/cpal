@@ -478,7 +478,7 @@ struct StreamInner {
 /// Holds the NSNotificationCenter + observer token so we can removeObserver: on Drop
 struct AppLaunchObserver {
     center: *mut objc2::runtime::AnyObject,
-    observer: *mut objc2::runtime::AnyObject,
+    observer: Retained<objc2::runtime::AnyObject>,
 }
 
 unsafe impl Send for AppLaunchObserver {}
@@ -487,7 +487,7 @@ unsafe impl Sync for AppLaunchObserver {}
 impl Drop for AppLaunchObserver {
     fn drop(&mut self) {
         unsafe {
-            let _: () = msg_send![self.center, removeObserver: self.observer];
+            let _: () = msg_send![self.center, removeObserver: &*self.observer];
         }
     }
 }
@@ -785,6 +785,8 @@ fn register_app_launch_observer(
             queue: std::ptr::null::<AnyObject>(),
             usingBlock: &*block
         ];
+        // Retain the observer so it stays alive until AppLaunchObserver is dropped
+        let observer = Retained::retain(observer).expect("addObserverForName returned null");
         // ObjC copies the block internally, so RcBlock can drop safely here
 
         AppLaunchObserver { center, observer }
