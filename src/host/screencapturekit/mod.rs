@@ -600,6 +600,9 @@ impl Stream {
     /// SCContentFilter update. This avoids the problem where calling `update_excluded_apps_by_names`
     /// and `update_excluded_apps_by_bundle_ids` separately would cause the second call to replace
     /// the first.
+    ///
+    /// Also updates the stored exclusion config and re-registers the NSWorkspace observer
+    /// so that `auto_refresh_exclusions` uses the new lists.
     pub fn update_excluded_apps(&self, names: &[&str], bundle_ids: &[&str]) -> Result<(), UpdateFilterError> {
         let stream = self.inner.borrow();
         let display_id = stream.display_id;
@@ -616,7 +619,32 @@ impl Stream {
             excluded_apps.extend(enumerate::find_apps_by_bundle_ids(&bundle_ids_vec));
         }
 
-        self.update_content_filter_internal(display_id, &excluded_apps)
+        drop(stream);
+
+        let result = self.update_content_filter_internal(display_id, &excluded_apps);
+
+        // Sync StreamInner's stored exclusion config and re-register observer
+        if result.is_ok() {
+            let new_names: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+            let new_bundle_ids: Vec<String> = bundle_ids.iter().map(|s| s.to_string()).collect();
+
+            let mut stream = self.inner.borrow_mut();
+            stream.excluded_app_names = new_names.clone();
+            stream.excluded_app_bundle_ids = new_bundle_ids.clone();
+
+            // Re-register observer with new exclusion lists
+            if !new_names.is_empty() || !new_bundle_ids.is_empty() {
+                stream.app_launch_observer = Some(register_app_launch_observer(
+                    new_names,
+                    new_bundle_ids,
+                    self.exclusion_refresh_needed.clone(),
+                ));
+            } else {
+                stream.app_launch_observer = None;
+            }
+        }
+
+        result
     }
 
     /// Internal method to update the content filter
