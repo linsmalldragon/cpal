@@ -969,6 +969,17 @@ mod platform_impl {
             matches!(&self.0, StreamInner::ScreenCaptureKit(_))
         }
 
+        /// Check if excluded apps have launched and auto-refresh the content filter.
+        ///
+        /// Call this periodically from a polling loop. Returns `Ok(())` immediately
+        /// if no refresh is needed. For non-SCK streams, always returns `Ok(())`.
+        pub fn auto_refresh_exclusions(&self) -> Result<(), UpdateFilterError> {
+            match &self.0 {
+                StreamInner::ScreenCaptureKit(s) => s.auto_refresh_exclusions(),
+                _ => Ok(()),
+            }
+        }
+
         /// Check if the stream has been stopped by the system (e.g., display disconnected)
         ///
         /// Returns `true` if the ScreenCaptureKit delegate received `didStopWithError`.

@@ -410,13 +410,33 @@ impl Device {
             }
         }
 
-        Ok(Stream::new(StreamInner {
-            _capturer: capturer,
-            sc_stream,
-            playing: false,
-            display_id: self.display_id,
-            stream_stopped,
-        }))
+        // Extract exclusion config for auto-refresh
+        let excluded_names = config.excluded_app_names.clone().unwrap_or_default();
+        let excluded_bundle_ids = config.excluded_app_bundle_ids.clone().unwrap_or_default();
+
+        let exclusion_refresh_needed = Arc::new(AtomicBool::new(false));
+
+        // Register NSWorkspace observer to detect when excluded apps launch
+        if !excluded_names.is_empty() || !excluded_bundle_ids.is_empty() {
+            register_app_launch_observer(
+                excluded_names.clone(),
+                excluded_bundle_ids.clone(),
+                exclusion_refresh_needed.clone(),
+            );
+        }
+
+        Ok(Stream::new(
+            StreamInner {
+                _capturer: capturer,
+                sc_stream,
+                playing: false,
+                display_id: self.display_id,
+                stream_stopped,
+                excluded_app_names: excluded_names,
+                excluded_app_bundle_ids: excluded_bundle_ids,
+            },
+            exclusion_refresh_needed,
+        ))
     }
 
     fn build_output_stream<D, E>(
@@ -444,6 +464,9 @@ struct StreamInner {
     display_id: u32,
     // Flag set when SCStreamDelegate reports stream stopped
     stream_stopped: Arc<AtomicBool>,
+    // Exclusion config for auto-refresh when excluded apps launch after stream creation
+    excluded_app_names: Vec<String>,
+    excluded_app_bundle_ids: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -451,14 +474,17 @@ pub struct Stream {
     inner: Rc<RefCell<StreamInner>>,
     /// Direct access to stream_stopped flag — no RefCell borrow needed
     stream_stopped: Arc<AtomicBool>,
+    /// Set by NSWorkspace observer when a matching excluded app launches
+    exclusion_refresh_needed: Arc<AtomicBool>,
 }
 
 impl Stream {
-    fn new(inner: StreamInner) -> Self {
+    fn new(inner: StreamInner, exclusion_refresh_needed: Arc<AtomicBool>) -> Self {
         let stream_stopped = inner.stream_stopped.clone();
         Self {
             inner: Rc::new(RefCell::new(inner)),
             stream_stopped,
+            exclusion_refresh_needed,
         }
     }
 
@@ -651,6 +677,40 @@ impl Stream {
         })
     }
 
+    /// Check if excluded apps have launched since stream creation and refresh the content filter.
+    ///
+    /// An NSWorkspace observer sets the internal flag when a matching app launches.
+    /// Call this periodically from a polling loop to apply the updated exclusions.
+    /// Returns `Ok(())` immediately if no refresh is needed.
+    pub fn auto_refresh_exclusions(&self) -> Result<(), UpdateFilterError> {
+        if !self.exclusion_refresh_needed.swap(false, Ordering::Acquire) {
+            return Ok(());
+        }
+
+        // Invalidate app cache to pick up newly launched processes
+        enumerate::invalidate_applications_cache();
+
+        let stream = self.inner.borrow();
+        let display_id = stream.display_id;
+        let names = stream.excluded_app_names.clone();
+        let bundle_ids = stream.excluded_app_bundle_ids.clone();
+        drop(stream);
+
+        if names.is_empty() && bundle_ids.is_empty() {
+            return Ok(());
+        }
+
+        let mut excluded_apps: Vec<Retained<SCRunningApplication>> = Vec::new();
+        if !names.is_empty() {
+            excluded_apps.extend(enumerate::find_apps_by_name_substrings(&names));
+        }
+        if !bundle_ids.is_empty() {
+            excluded_apps.extend(enumerate::find_apps_by_bundle_ids(&bundle_ids));
+        }
+
+        self.update_content_filter_internal(display_id, &excluded_apps)
+    }
+
     /// Check if the stream has been stopped by the system (e.g., display disconnected)
     ///
     /// This reads the Arc<AtomicBool> directly — no RefCell borrow needed,
@@ -658,6 +718,103 @@ impl Stream {
     pub fn is_stream_stopped(&self) -> bool {
         self.stream_stopped.load(Ordering::Acquire)
     }
+}
+
+/// Register an NSWorkspace observer that sets the flag when a matching excluded app launches.
+///
+/// Uses `NSWorkspaceDidLaunchApplicationNotification`. The observer is leaked via
+/// `std::mem::forget` to keep it alive for the stream's lifetime (same pattern as screen_lock.rs).
+fn register_app_launch_observer(
+    excluded_names: Vec<String>,
+    excluded_bundle_ids: Vec<String>,
+    flag: Arc<AtomicBool>,
+) {
+    use objc2::runtime::AnyObject;
+    use objc2_foundation::NSNotificationName;
+    use std::ptr::NonNull;
+
+    unsafe {
+        // NSWorkspace.sharedWorkspace
+        let workspace: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
+        // workspace.notificationCenter
+        let center: *mut AnyObject = msg_send![workspace, notificationCenter];
+
+        let name = NSNotificationName::from_str("NSWorkspaceDidLaunchApplicationNotification");
+
+        let block = RcBlock::new(
+            move |notification: NonNull<objc2_foundation::NSNotification>| {
+                let matched = extract_and_check_launched_app(
+                    notification.as_ref(),
+                    &excluded_names,
+                    &excluded_bundle_ids,
+                );
+                if matched {
+                    flag.store(true, Ordering::Release);
+                }
+            },
+        );
+
+        let observer: *mut AnyObject = msg_send![
+            center,
+            addObserverForName: &*name,
+            object: std::ptr::null::<AnyObject>(),
+            queue: std::ptr::null::<AnyObject>(),
+            usingBlock: &*block
+        ];
+        // Leak observer + block to keep them alive
+        std::mem::forget(block);
+        let _ = observer;
+    }
+}
+
+/// Extract launched app info from NSWorkspaceDidLaunchApplicationNotification and check exclusion match.
+unsafe fn extract_and_check_launched_app(
+    notification: &objc2_foundation::NSNotification,
+    excluded_names: &[String],
+    excluded_bundle_ids: &[String],
+) -> bool {
+    use objc2::runtime::AnyObject;
+    use objc2_foundation::NSString;
+
+    // notification.userInfo -> NSDictionary
+    let user_info: *mut AnyObject = msg_send![notification, userInfo];
+    if user_info.is_null() {
+        return false;
+    }
+
+    // userInfo["NSWorkspaceApplicationKey"] -> NSRunningApplication
+    let key = NSString::from_str("NSWorkspaceApplicationKey");
+    let app: *mut AnyObject = msg_send![user_info, objectForKey: &*key];
+    if app.is_null() {
+        return false;
+    }
+
+    // Check bundle ID (exact match)
+    if !excluded_bundle_ids.is_empty() {
+        let bundle_id: *mut NSString = msg_send![app, bundleIdentifier];
+        if !bundle_id.is_null() {
+            let bundle_id_str = (*bundle_id).to_string();
+            if excluded_bundle_ids.iter().any(|bid| bid == &bundle_id_str) {
+                return true;
+            }
+        }
+    }
+
+    // Check app name (substring match)
+    if !excluded_names.is_empty() {
+        let app_name: *mut NSString = msg_send![app, localizedName];
+        if !app_name.is_null() {
+            let app_name_str = (*app_name).to_string();
+            if excluded_names
+                .iter()
+                .any(|sub| app_name_str.contains(sub.as_str()))
+            {
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 impl StreamTrait for Stream {
